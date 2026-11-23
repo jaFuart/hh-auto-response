@@ -24,32 +24,37 @@ class ApplicationLogging(unittest.TestCase):
         self.responder = Responder(Mock(url="https://hh.ru/search/vacancy"), self.cfg, Path("unused"), None,
                                    self.ai, "Python resume", recent_letters=["Prior confirmed letter"])
 
-    def test_log_uses_last_field_readback_and_keeps_generation_metadata_separate(self):
+    def test_log_uses_verified_prepared_field_and_keeps_generation_metadata_separate(self):
         textarea = Mock()
-        textarea.input_value.side_effect = ["Field normalized text", "Actually submitted text"]
+        textarea.input_value.return_value = self.ai.write_letter.return_value
+        button = Mock()
+        button.evaluate.return_value = {"values": [self.ai.write_letter.return_value]}
 
         def generate(*args, **kwargs):
             self.ai.last_letter_record = {"selected_projects": ["VPN"], "model_version": "test"}
             return "Prepared letter that meets the chosen vacancy requirements."
 
         def apply(vac):
-            self.responder.clicked = True
+            self.responder.page.url = "https://hh.ru/applicant/vacancy_response?vacancyId=101"
             self.assertTrue(self.responder._put_letter(textarea, self.ai.write_letter.return_value))
-            self.assertIsNone(self.responder._submit(Mock(), Mock(), "Send"))
+            self.assertIsNone(self.responder._submit(Mock(), button, "Send"))
             return Result(Status.APPLIED, letter=True)
 
         self.ai.write_letter.side_effect = generate
         with patch("hh_auto.hh.responder.fetch_vacancy_text", return_value="Complete vacancy"), \
                 patch.object(self.responder, "_apply", side_effect=apply), \
+                patch.object(self.responder, "application_status", return_value="not_applied"), \
+                patch.object(self.responder, "_direct_resume_matches", return_value=True), \
+                patch.object(self.responder, "_reserve_submission"), \
                 patch.object(self.responder, "_wait_enabled", return_value=True), \
                 patch.object(self.responder, "_pause"), patch.object(self.responder, "_visible", return_value=False), \
                 patch.object(self.responder, "on_search_page", return_value=True), \
                 patch.object(self.responder, "_questions_shown", return_value=False), \
                 patch("hh_auto.hh.responder.captcha_shown", return_value=False):
             result = self.responder.apply(self.vac)
-        self.assertEqual(result.letter_text, "Actually submitted text")
+        self.assertEqual(result.letter_text, self.ai.write_letter.return_value)
         self.assertEqual(result.generation["selected_projects"], ["VPN"])
-        self.assertNotEqual(result.generation["prepared_letter"], result.letter_text)
+        self.assertEqual(result.generation["prepared_letter"], result.letter_text)
         self.assertTrue(result.delivery["outbound_attempted"])
         self.assertTrue(result.delivery["letter_attachment_confirmed"])
         self.assertEqual(self.ai.write_letter.call_args.kwargs["vacancy_id"], "101")

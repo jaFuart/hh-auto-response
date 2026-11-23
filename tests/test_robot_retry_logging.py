@@ -34,7 +34,7 @@ class RobotRetryLogging(unittest.TestCase):
             self.addCleanup(p.stop)
 
     def converse(self):
-        return chats._converse(Mock(), self.chat, self.cfg, self.ai, "Python resume", self.stats, False,
+        return chats._converse(Mock(url="https://hh.ru/chat/chat1"), self.chat, self.cfg, self.ai, "Python resume", self.stats, False,
                                self.log, [], self.question, "chat")
 
     def released(self, number):

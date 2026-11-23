@@ -105,7 +105,8 @@ def default_chats() -> list[MockChat]:
                          "Спасибо за ответы! Анкета завершена, работодатель свяжется с вами."]),
         MockChat("3", "Приглашение", "Компания 3", ["Добрый день! Когда вам удобно созвониться?"]),
         MockChat("4", "Паспорт", "Компания 4", ["Укажите, пожалуйста, ваши паспортные данные для оформления пропуска."]),
-        MockChat("5", "Документы кнопкой", "Компания 5", ["Готовы ли вы предоставить выписку из ЭТК?"],
+        MockChat("5", "Документы кнопкой", "Компания 5", [
+                 {"text": "Готовы ли вы предоставить выписку из ЭТК?", "author": "Робот hh", "robot": True}],
                  buttons=["Нет, не готов", "Да, готов"],
                  script=["Спасибо за ответы! Анкета завершена, работодатель свяжется с вами."]),
     ]
@@ -283,11 +284,13 @@ document.addEventListener('click', (event) => {
 _CHAT_JS = r"""
 let opened = null;
 const messageText = (message) => typeof message === 'string' ? message : message.text;
-const messageHtml = (message, index) => {
+const messageHtml = (message, index, buttons = []) => {
   if (typeof message === 'string') return `<div class="msg">${message}</div>`;
   const kind = message.outgoing ? 'message-my--mock' : message.robot ? 'magritte-bot___mock' : '';
+  const answers = buttons.length ? `<div id="answers">${buttons.map((b) =>
+    `<button type="button" class="answer">${b}</button>`).join('')}</div>` : '';
   return `<div class="msg" data-qa="chatik-chat-message-${index + 1}"><div class="${kind}">
-    <span data-qa="chat-bubble-label">${message.author || 'работодатель'}</span><div>${message.text}</div></div></div>`;
+    <span data-qa="chat-bubble-label">${message.author || 'работодатель'}</span><div>${message.text}</div>${answers}</div></div>`;
 };
 const render = () => {
   const only = document.querySelector('[data-qa="chatik-checkbox-only-unread"]').checked;
@@ -324,8 +327,8 @@ function showPanel(chat) {
   const panel = document.getElementById('panel');
   const draft = panel.querySelector('textarea');
   const keep = draft && opened === chat ? draft.value : '';
-  panel.innerHTML = `<h3>${chat.title}</h3><div id="messages">${chat.log.map(messageHtml).join('')}</div>
-    <div id="answers">${chat.buttons.map((b) => `<button type="button" class="answer">${b}</button>`).join('')}</div>
+  panel.innerHTML = `<h3>${chat.title}</h3><div id="messages">${chat.log.map((message, index) =>
+    messageHtml(message, index, index === chat.log.length - 1 ? chat.buttons : [])).join('')}</div>
     ${chat.closed ? '' : '<div><textarea></textarea><button type="button" data-qa="chat-send">Отправить</button></div>'}`;
   for (const button of panel.querySelectorAll('.answer')) button.onclick = () => send(chat, button.textContent, 'button');
   const box = panel.querySelector('textarea');
@@ -424,6 +427,10 @@ class MockHh:
         if path.startswith("/search/vacancy"):
             return 200, self._search(query), page
         if path == "/applicant/vacancy_response":
+            wanted = query.get("vacancyId", [""])[0]
+            vac = next((v for batch in self.pages for v in batch if v["id"] == wanted), None)
+            if vac is not None and vac["flow"] == "modal":
+                return 200, self._response_form(vac), page
             return 200, self._questions(query), page
         if path.startswith("/vacancy/"):
             return 200, self._vacancy(path.rstrip("/").rsplit("/", 1)[-1]), page
@@ -496,9 +503,35 @@ class MockHh:
         title = html.escape(vac["title"]) if vac else "Вакансия"
         state = ('<div data-qa="vacancy-response-link-view-topic">Вы откликнулись</div>'
                  if vacancy_id in {r["id"] for r in self.sent} else
+                 f'<a href="/applicant/vacancy_response?vacancyId={html.escape(vacancy_id)}&amp;employerId=999" '
+                 'data-qa="vacancy-response-link-top">Откликнуться</a>'
+                 if vac is not None and vac["flow"] == "modal" else
                  '<a href="#" data-qa="vacancy-response-link-top">Откликнуться</a>')
         return (f"<!doctype html><meta charset=utf-8><title>{title}</title>{_PAGE_STYLE}<body>"
                 f'<h1 data-qa="vacancy-title">{title}</h1>{state}</body>')
+
+    def _response_form(self, vac: dict) -> str:
+        """Observed GET response page: the letter and selected resume belong to the native submit form."""
+        script = """
+const form=document.getElementById('RESPONSE_MODAL_FORM_ID');
+form.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const letter=form.querySelector('textarea').value;
+  const resume=form.querySelector('input[name="resumeId"]').value;
+  if (!letter.trim()) return;
+  await fetch('/mock/sent', {method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({id:form.dataset.vacancyId,flow:'modal',letter,resume,native_form:true})});
+  form.remove();
+  document.body.insertAdjacentHTML('beforeend',
+    '<p data-qa="vacancy-response-link-view-topic">Вы откликнулись</p>');
+});
+"""
+        return (f'<!doctype html><meta charset=utf-8><title>Отклик</title>{_PAGE_STYLE}<body>'
+                f'<form id="RESPONSE_MODAL_FORM_ID" data-vacancy-id="{html.escape(vac["id"])}">'
+                f'<input type="hidden" name="resumeId" value="{RESUME_ID}">'
+                '<textarea data-qa="vacancy-response-popup-form-letter-input"></textarea>'
+                '<button type="submit" data-qa="vacancy-response-submit-popup">Откликнуться</button>'
+                f'</form><script>{script}</script></body>')
 
     def _questions(self, query: dict) -> str:
         wanted = query.get("vacancyId", [""])[0]

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -28,7 +28,8 @@ FORM = """<!doctype html><meta charset="utf-8"><script>window.sent=[];</script>
 <textarea data-qa="vacancy-response-popup-form-letter-input"></textarea>
 <button type="button" data-qa="vacancy-response-submit-popup" onclick="
  const selected=document.querySelector('input[name=resumeId]:checked') || document.querySelector('input[name=resumeId]');
- window.sent.push({{resume:selected ? selected.value : '',letter:document.querySelector('textarea').value}});
+ const letter=document.querySelector('form').querySelector('textarea,input[name=letter]');
+ window.sent.push({{resume:selected ? selected.value : '',letter:letter ? letter.value : ''}});
  document.querySelector('form').remove();
  document.body.insertAdjacentHTML('beforeend','<p data-qa=vacancy-response-link-view-topic>Вы откликнулись</p>');
 ">Откликнуться</button></form>"""
@@ -61,7 +62,8 @@ def main():
             if path == "/vacancy/101":
                 route.fulfill(status=200, content_type="text/html; charset=utf-8", body=VACANCY)
             elif path == "/applicant/vacancy_response":
-                route.fulfill(status=200, content_type="text/html; charset=utf-8", body=FORM.format(resume=fixture["resume"]))
+                route.fulfill(status=200, content_type="text/html; charset=utf-8",
+                              body=fixture.get("form") or FORM.format(resume=fixture["resume"]))
             else:
                 route.abort()
 
@@ -86,10 +88,66 @@ def main():
             assert result.status is Status.FAILED and not result.delivery["outbound_attempted"]
             assert page.evaluate("window.sent") == []
 
+            cfg.letter.mode = "ai"
+            prepared = "Добрый день!\n\nРазрабатывал API и проверял данные для пользовательских задач."
+            ai = Mock(last_letter_record={})
+            ai.write_letter.return_value = prepared
+            ai.last_letter_record = {}
+            resume = '<input type="hidden" name="resumeId" value="selected">'
+            base = FORM.format(resume=resume)
+            editor = '<textarea data-qa="vacancy-response-popup-form-letter-input"></textarea>'
+
+            def ai_apply(html, *, clear_after_reserve=False):
+                fixture["form"] = html
+                sender = Responder(page, cfg, Path("unused"), "Fixture resume", ai, "Python API resume")
+                with patch.object(module, "fetch_vacancy_text", return_value="Develop Python APIs"):
+                    if clear_after_reserve:
+                        with patch.object(sender, "_reserve_submission", side_effect=lambda: page.locator(
+                                'textarea').fill("")):
+                            outcome = sender.apply_on_vacancy(vacancy)
+                    else:
+                        outcome = sender.apply_on_vacancy(vacancy)
+                return outcome, page.evaluate("window.sent")
+
+            result, sent = ai_apply(base)
+            assert result.status is Status.APPLIED and result.letter_text == prepared
+            assert sent == [{"resume": "selected", "letter": prepared}]
+            assert result.delivery["letter_attachment_confirmed"]
+
+            for broken in (base.replace(editor, ""),
+                           base.replace(editor, editor.replace("<textarea ", '<textarea oninput="this.value=\'\'" '))):
+                result, sent = ai_apply(broken)
+                assert result.status is Status.FAILED and not result.delivery["outbound_attempted"]
+                assert sent == []
+
+            result, sent = ai_apply(base, clear_after_reserve=True)
+            assert result.status is Status.FAILED and not result.delivery["outbound_attempted"]
+            assert sent == []
+
+            for persists in (False, True):
+                save_action = ("const input=document.createElement('input');input.type='hidden';input.name='letter';"
+                               "input.value=popup.querySelector('textarea').value;"
+                               "document.querySelector('form').append(input);") if persists else ""
+                optional = base.replace(editor, '<button type="button" id="openLetter" '
+                                         'data-qa="vacancy-response-letter-toggle">Добавить сопроводительное</button>')
+                optional += """<script>document.getElementById('openLetter').onclick=()=>{
+                  const popup=document.createElement('div');popup.setAttribute('role','dialog');
+                  popup.innerHTML=`<textarea data-qa="vacancy-response-popup-form-letter-input"></textarea>
+                    <button type="button" data-qa="vacancy-response-letter-submit">Сохранить</button>`;
+                  document.body.append(popup);popup.querySelector('button').onclick=()=>{
+                """ + save_action + "popup.remove();};};</script>"
+                result, sent = ai_apply(optional)
+                if persists:
+                    assert result.status is Status.APPLIED and result.letter_text == prepared, (result, sent)
+                    assert sent == [{"resume": "selected", "letter": prepared}]
+                else:
+                    assert result.status is Status.FAILED and not result.delivery["outbound_attempted"]
+                    assert sent == []
+
         assert all(method == "GET" for method, _ in requests)
         context.close()
         browser.close()
-    print("Offline targeted retry passed: GET only, exact selected ID, actual letter readback, ambiguous resume no send.")
+    print("Offline targeted retry passed: GET only, exact selected ID, required AI letter, cleared/missing draft no send, persisted optional draft verified.")
 
 
 if __name__ == "__main__":

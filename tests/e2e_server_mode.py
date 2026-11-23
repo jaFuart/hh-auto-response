@@ -13,7 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from mock_hh import FakeLlm, MockChat, MockHh, use_mock, vacancy, write_config
+from mock_hh import RESUME_ID, FakeLlm, MockChat, MockHh, use_mock, vacancy, write_config
 from hh_auto import app
 from hh_auto.core.config import load_config
 from hh_auto.core.logger import setup_logging
@@ -64,7 +64,11 @@ def main():
                 runner = ServerRunner(root, responses, robots, clock=lambda: now)
                 assert runner.tick(cfg) == [("responses", 0), ("robot_replies", 0)]
             assert used_headless == [True, True]
-            assert len([row for row in mock.sent if row["id"] == "951"]) == 1
+            applications = [row for row in mock.sent if row["id"] == "951"]
+            assert len(applications) == 1
+            assert applications[0]["native_form"] is True and applications[0]["letter"].strip()
+            assert applications[0]["resume"] == RESUME_ID
+            assert "/applicant/vacancy_response" in mock.visited
             assert mock.chat_sent == [{"chat": "952", "text": "Живу в городе Москва.", "kind": "text"}]
             assert not mock.outside, "A browser request escaped the mock"
             with runner_lock(root):

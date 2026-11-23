@@ -109,6 +109,23 @@ class _Outcome(Enum):
 
 GENERATE_GIVE_UP = 2  # столько раз подряд «Сгенерировать» не дал письма — больше в этом запуске не жмём
 
+_LETTER_DRAFT_FIELDS = (S.LETTER_INPUT + ',textarea[name="letter"],input[name="letter"],'
+                       'textarea[name="cover_letter"],input[name="cover_letter"]')
+_LETTER_DRAFT_JS = """(button, options) => {
+    if (!button.isConnected || button.disabled) return null;
+    const form = button.form || button.closest('form');
+    const root = options.draftOnly ? (button.closest('[role="dialog"]') || form) : form;
+    if (!root || !root.isConnected) return null;
+    const fields = Array.from(root.querySelectorAll(options.selector)).filter(el =>
+        el.isConnected && !el.disabled && /^(TEXTAREA|INPUT)$/.test(el.tagName) &&
+        (options.draftOnly || el.form === form));
+    return {values: fields.map(el => el.value)};
+}"""
+
+
+def _letter_text(value: str) -> str:
+    return value.replace("\r\n", "\n").replace("\r", "\n")
+
 
 class Responder:
     def __init__(self, page: Page, cfg: Config, snapshots_dir: Path, resume_title: str | None,
@@ -129,6 +146,7 @@ class Responder:
         self._recent_letters = list(recent_letters or [])[-10:]
         self._filled_letter_text = ""
         self._letter_field: Locator | None = None
+        self._letter_submission_verified = False
         self._generation: dict = {}
         self._direct_vacancy_id: str | None = None
         self._quota_vacancy_id: str | None = None
@@ -156,6 +174,7 @@ class Responder:
                 self._prepared_ai_letter = None
                 self._filled_letter_text = ""
                 self._letter_field = None
+                self._letter_submission_verified = False
                 self._generation = {}
                 return self._finish_result(vac, Result(
                     Status.APPLIED if status == "applied" else Status.FAILED,
@@ -170,6 +189,10 @@ class Responder:
         """Откликается на вакансию; непредвиденные исключения превращает в Result(FAILED).
 
         Капча вместо отклика — не ошибка: ждём, пока человек её решит, и повторяем ту же вакансию."""
+        if self.cfg.letter.mode == "ai" and not self.resume_text.strip():
+            raise FatalError("нет текста выбранного резюме для сопроводительного — отклик не отправлен")
+        if self.cfg.letter.mode == "ai" and self._direct_vacancy_id != vac.id:
+            return self.apply_on_vacancy(vac)
         after_captcha = False
         self._quota_vacancy_id = vac.id
         self.letter_kind = "none"
@@ -177,10 +200,9 @@ class Responder:
         self._prepared_ai_letter = None
         self._filled_letter_text = ""
         self._letter_field = None
+        self._letter_submission_verified = False
         self._generation = {}
         self._submission_reserved = False
-        if self.cfg.letter.mode == "ai" and not self.resume_text.strip():
-            raise FatalError("нет текста выбранного резюме для сопроводительного — отклик не отправлен")
         if self.cfg.letter.mode == "ai":
             # При быстром отклике первый клик уже отправляет заявку. Подготовим письмо до этого клика,
             # чтобы сбой ИИ или отсутствие описания вакансии не оставили отклик без письма.
@@ -232,10 +254,16 @@ class Responder:
         if self._filled_letter_text:
             result.generation["filled_letter"] = self._filled_letter_text
         confirmed = result.status is Status.APPLIED
-        result.letter_text = self._filled_letter_text if confirmed and result.letter else ""
+        ai_verified = (self._letter_submission_verified and self._prepared_ai_letter is not None
+                       and self._prepared_ai_letter[0] == vac.id
+                       and _letter_text(self._filled_letter_text) == _letter_text(self._prepared_ai_letter[1]))
+        attached = bool(confirmed and result.letter and self._filled_letter_text.strip()
+                        and (self.cfg.letter.mode != "ai" or ai_verified))
+        result.letter = attached
+        result.letter_text = self._filled_letter_text if attached else ""
         result.delivery = {**(result.delivery or {}), "outbound_attempted": self.clicked,
                            "status": "confirmed" if confirmed else ("unknown" if self.clicked else "not_attempted"),
-                           "letter_attachment_confirmed": bool(confirmed and result.letter),
+                           "letter_attachment_confirmed": attached,
                            "confirmation_source": "hh_ui_flow" if confirmed else "",
                            "letter_kind": self.letter_kind}
         if result.letter_text:
@@ -359,6 +387,8 @@ class Responder:
         self._close_dialogs()  # хвосты от предыдущей вакансии
         if self._direct_vacancy_id == vac.id:
             return self._apply_direct(vac)
+        if self.cfg.letter.mode == "ai":
+            return Result(Status.FAILED, "для письма ИИ требуется проверенная форма вакансии — быстрый отклик запрещён")
         card = self._card(vac.id)
         if card.count() == 0:  # выдачу только что открыли заново — hh догружает карточки не сразу
             try:
@@ -763,14 +793,21 @@ class Responder:
             form = self._open_questions_letter()
             if form is None:
                 self._snapshot(vac.id, "questions-letter")
+                if self.cfg.letter.mode == "ai":
+                    return Result(Status.FAILED, "нет проверенного поля письма ИИ — отклик не отправлен")
                 return self._skip_questions("не открылось поле сопроводительного письма", remember=False)
             scope, textarea, save = form
             if not self._write_letter(scope, textarea, vac):
+                if self.cfg.letter.mode == "ai":
+                    return Result(Status.FAILED, "письмо ИИ не заполнено — отклик не отправлен")
                 return self._skip_questions("не удалось получить сопроводительное письмо", remember=False)
             if save is not None:
-                error = self._submit(scope, save, "«Сохранить» (письмо)", questions_page=True, until_hidden=True)
+                error = self._submit(scope, save, "«Сохранить» (письмо)", questions_page=True, until_hidden=True,
+                                     draft_only=self.cfg.letter.mode == "ai")
                 if error:
                     self._snapshot(vac.id, "questions-letter-save")
+                    if self.cfg.letter.mode == "ai":
+                        return Result(Status.FAILED, f"письмо ИИ не сохранилось: {error}")
                     return self._skip_questions(f"письмо не сохранилось: {error}", remember=False)
         else:
             log.info("  письма отключены ([letter] mode = none) — отправляю только ответ")
@@ -871,6 +908,8 @@ class Responder:
             letter = self._write_letter(dialog, textarea.first, vac)
             if not letter:
                 self._close_dialogs()
+                if self.cfg.letter.mode == "ai":
+                    return Result(Status.FAILED, "письмо ИИ не заполнено — отклик не отправлен")
                 return Result(Status.SKIPPED, "не удалось получить сопроводительное письмо")
         elif textarea.count():
             log.info("  письма отключены ([letter] mode = none) — откликаюсь без письма")
@@ -878,8 +917,10 @@ class Responder:
             log.info("  письмо необязательное, письма отключены ([letter] mode = none) — откликаюсь без письма")
         else:
             letter = self._optional_letter(dialog, vac)
-            if letter is None:  # окно письма не закрылось — и отклик не отправить
+            if letter is None or self.cfg.letter.mode == "ai" and not letter:
                 self._close_dialogs()
+                if self.cfg.letter.mode == "ai":
+                    return Result(Status.FAILED, "не удалось приложить письмо ИИ — отклик не отправлен")
                 return Result(Status.SKIPPED, "не удалось приложить необязательное письмо")
 
         submit = dialog.locator(S.MODAL_SUBMIT).first
@@ -908,8 +949,9 @@ class Responder:
         (раньше такие отклики уходили без письма). Не вышло — письмо необязательное, откликаемся без него
         (False). None — окно письма не закрылось, и отклик отправить нельзя."""
         toggle = self._letter_toggle(dialog)
+        consequence = ("отклик не отправляется" if self.cfg.letter.mode == "ai" else "откликаюсь без письма")
         if toggle is None:
-            log.warning("  ! в окне нет ни поля для письма, ни кнопки «Добавить сопроводительное» — откликаюсь без письма")
+            log.warning(f"  ! в окне нет ни поля для письма, ни кнопки «Добавить сопроводительное» — {consequence}")
             self._snapshot_once(vac.id, "modal-no-letter")
             return False
         self._pause()
@@ -917,17 +959,18 @@ class Responder:
         toggle.click()
         form = self._wait_modal_letter(dialog)
         if form is None:
-            log.warning("  ! поле письма не появилось — откликаюсь без письма")
+            log.warning(f"  ! поле письма не появилось — {consequence}")
             self._snapshot_once(vac.id, "modal-letter-form")
             return False
         scope, textarea, save = form
         if not self._write_letter(scope, textarea, vac):
-            log.warning("  ! письмо не получилось — оно необязательное, откликаюсь без него")
+            log.warning(f"  ! письмо не получилось — {consequence}")
             return False if save is None else self._close_letter_window(scope)
         if save is not None:
-            error = self._submit(scope, save, "«Сохранить» (письмо)")
+            error = self._submit(scope, save, "«Сохранить» (письмо)",
+                                 draft_only=self.cfg.letter.mode == "ai")
             if error:
-                log.warning(f"  ! письмо не сохранилось ({error}) — откликаюсь без него")
+                log.warning(f"  ! письмо не сохранилось ({error}) — {consequence}")
                 return self._close_letter_window(scope)
         return True
 
@@ -948,10 +991,6 @@ class Responder:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:
-                inline = dialog.locator(S.LETTER_INPUT).filter(visible=True)
-                if inline.count():
-                    log.info("  поле письма раскрылось в окне отклика")
-                    return dialog, inline.first, None
                 separate = (self.page.locator(S.DIALOG).filter(has=self.page.locator(S.LETTER_INPUT))
                             .filter(has_not=self.page.locator(S.MODAL_SUBMIT)).filter(visible=True))
                 if separate.count():
@@ -959,6 +998,10 @@ class Responder:
                     save = window.locator(S.LETTER_SUBMIT).or_(window.get_by_role("button", name=SAVE_BUTTON_TEXT))
                     log.info("  открылось окно «Сопроводительное письмо»")
                     return window, window.locator(S.LETTER_INPUT).first, save.first
+                inline = dialog.locator(S.LETTER_INPUT).filter(visible=True)
+                if inline.count():
+                    log.info("  поле письма раскрылось в окне отклика")
+                    return dialog, inline.first, None
             except PlaywrightError:
                 pass
             control.sleep(0.3)
@@ -986,6 +1029,8 @@ class Responder:
             self._snapshot(vacancy_id, tag)
 
     def _handle_quick(self, vac: Vacancy, card: Locator) -> Result:
+        if self.cfg.letter.mode == "ai":
+            return Result(Status.FAILED, "неожиданный быстрый отклик: письмо не подтверждено; требуется проверка hh")
         if self.cfg.letter.mode == "none":
             log.success("  ✓ ОТКЛИК ОТПРАВЛЕН сразу (письма отключены — не прикладываю)")
             self._log_card_state(card)
@@ -1066,8 +1111,7 @@ class Responder:
             return self._letter_done("template", self._fill_letter(
                 textarea, self.cfg.letter.template_text, vac, "готовое письмо из настроек", "[letter] template_text"))
         if self.cfg.letter.mode == "ai":
-            return self._letter_done("ai", self._ai_letter(textarea, vac)) or self._letter_done("fallback", self._fill_letter(
-                textarea, self.cfg.letter.fallback_text, vac, "запасной текст письма", "[letter] fallback_text"))
+            return self._letter_done("ai", self._ai_letter(textarea, vac))
         before = textarea.input_value().strip()
         if before:
             log.debug(f"  в поле письма уже есть текст ({len(before)} симв.)")
@@ -1185,7 +1229,12 @@ class Responder:
                     textarea.fill(text, timeout=10_000)
                     self._letter_field = textarea
                     value = textarea.input_value()
-                    self._filled_letter_text = value if isinstance(value, str) else text
+                    if (not isinstance(value, str) or not value.strip()
+                            or _letter_text(value) != _letter_text(text)):
+                        self._filled_letter_text = ""
+                        log.warning("  ! фактический текст поля не совпадает с письмом — отправка запрещена")
+                        return False
+                    self._filled_letter_text = value
                     return True
             except PlaywrightError as e:
                 if "closed" in str(e).lower():
@@ -1223,6 +1272,34 @@ class Responder:
 
     # --- вспомогательное ---
 
+    def _required_ai_letter_error(self, button: Locator, *, draft_only: bool) -> str | None:
+        if self.cfg.letter.mode != "ai":
+            return None
+        prepared = self._prepared_ai_letter
+        vacancy_id = self._direct_vacancy_id
+        if (not vacancy_id or not prepared or prepared[0] != vacancy_id
+                or self._quota_vacancy_id != vacancy_id or not prepared[1].strip()):
+            return "письмо ИИ не привязано к выбранной вакансии — отправка запрещена"
+        parsed = urlparse(self.page.url)
+        host = parsed.hostname or ""
+        if (parsed.scheme != "https" or not (host == "hh.ru" or host.endswith(".hh.ru"))
+                or parsed.username or parsed.password or parsed.port not in (None, 443)
+                or parsed.path.rstrip("/") != "/applicant/vacancy_response"
+                or parse_qs(parsed.query).get("vacancyId") != [vacancy_id]):
+            return "адрес формы не совпадает с вакансией письма — отправка запрещена"
+        try:
+            proof = button.evaluate(_LETTER_DRAFT_JS, {"selector": _LETTER_DRAFT_FIELDS,
+                                                        "draftOnly": draft_only})
+        except PlaywrightError:
+            return "актуальное поле письма ИИ недоступно — отправка запрещена"
+        values = proof.get("values") if isinstance(proof, dict) else None
+        if (not isinstance(values, list) or not values
+                or not all(isinstance(value, str) and value.strip()
+                           and _letter_text(value) == _letter_text(prepared[1]) for value in values)):
+            return "в форме нет подтверждённого полного письма ИИ — отправка запрещена"
+        self._filled_letter_text = values[0]
+        return None
+
     def _submit(
         self,
         scope: Locator | Page,
@@ -1230,6 +1307,7 @@ class Responder:
         label: str,
         questions_page: bool = False,
         until_hidden: bool = False,
+        draft_only: bool = False,
     ) -> str | None:
         """Жмёт кнопку отправки и ждёт, пока форма закроется. Возвращает текст ошибки или None.
 
@@ -1241,7 +1319,10 @@ class Responder:
         self._pause()
         if self._direct_vacancy_id and not self._direct_resume_matches():
             return "ID выбранного резюме не подтверждён перед отправкой"
-        if self._letter_field is not None:
+        error = self._required_ai_letter_error(button, draft_only=draft_only)
+        if error:
+            return error
+        if self.cfg.letter.mode != "ai" and self._letter_field is not None:
             try:
                 value = self._letter_field.input_value()
                 if isinstance(value, str):
@@ -1249,8 +1330,18 @@ class Responder:
             except PlaywrightError:  # a saved optional-letter dialog may already be detached
                 pass
         log.info(f"  → нажимаю {label}")
-        self._reserve_submission()
-        if self._direct_vacancy_id:
+        if not draft_only:
+            self._reserve_submission()
+        if self.cfg.letter.mode == "ai":
+            # Disk reservation and resume-menu reads may give a controlled form time to rerender.
+            if not self._direct_resume_matches():
+                return "ID выбранного резюме не подтверждён перед отправкой"
+            error = self._required_ai_letter_error(button, draft_only=draft_only)
+            if error:
+                return error
+            if not draft_only:
+                self._letter_submission_verified = True
+        if self._direct_vacancy_id and not draft_only:
             self.clicked = True  # the GET above is read-only; the form click is the first possible outbound
         button.click()
         deadline = time.monotonic() + 20

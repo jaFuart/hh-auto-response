@@ -2,7 +2,7 @@
 from dataclasses import replace
 import unittest
 
-from hh_auto.ai.application import analyze_vacancy, make_letter_plan
+from hh_auto.ai.application import analyze_vacancy, make_letter_plan, validate_letter
 from hh_auto.ai.client import LETTER_PROMPT
 from hh_auto.ai.letters import ADJACENT_EXPERIENCE_PREFIX, _requested_style
 from hh_auto.ai.profile import CandidateSkill
@@ -69,6 +69,39 @@ class AdjacentExperienceLetters(unittest.TestCase):
         self.assertNotIn(ADJACENT_EXPERIENCE_PREFIX, self.normalize(''))
         self.assertNotIn(ADJACENT_EXPERIENCE_PREFIX, self.normalize(WORKFLOW))
 
+    def test_concrete_case_actions_are_labelled_and_validated_without_registry_names(self):
+        for text in (
+            'Настраивал провайдерные адаптеры доставки, валидацию заявок и обработку ошибок API.',
+            'Работал над согласованием курьерских отправлений и обработкой ответов служб доставки.',
+            'Писал код валидации заявок и обработки ошибок служб доставки.',
+        ):
+            with self.subTest(text=text):
+                issues = validate_letter(text, self.analysis, self.profile, plan=self.plan)
+                self.assertTrue(any(issue.startswith('style:adjacent_marker') for issue in issues), issues)
+                result = self.normalize(text + '\n\n' + WORKFLOW)
+                self.assertEqual(result.count(ADJACENT_EXPERIENCE_PREFIX), 1, result)
+                self.assertIn('\n\n' + WORKFLOW, result)
+                self.assertFalse(any(issue.startswith('style:adjacent_marker') for issue in
+                                     validate_letter(result, self.analysis, self.profile, plan=self.plan)))
+                self.assertEqual(self.normalize(result), result)
+
+    def test_ai_workflow_does_not_receive_case_marker_even_with_shared_data_vocabulary(self):
+        workflow = ('Работал с Cursor и Codex, писал промпты для валидации заявок и нормализации данных. '
+                    'Проверял с ИИ-ассистентом код интеграций доставки.')
+        self.assertNotIn(ADJACENT_EXPERIENCE_PREFIX, self.normalize(workflow))
+        text = ADJACENT_EXPERIENCE_PREFIX + ' ' + workflow + '\n\n' + CASE
+        result = self.normalize(text)
+        self.assertEqual(result.count(ADJACENT_EXPERIENCE_PREFIX), 1, result)
+        self.assertIn('\n\n' + ADJACENT_EXPERIENCE_PREFIX + ' разрабатывал', result)
+        self.assertFalse(any(issue.startswith('style:adjacent_marker') for issue in
+                             validate_letter(result, self.analysis, self.profile, plan=self.plan)))
+
+    def test_duplicate_case_markers_are_reported_and_normalized_to_one(self):
+        text = ADJACENT_EXPERIENCE_PREFIX + ' ' + CASE + '\n\n' + ADJACENT_EXPERIENCE_PREFIX + ' ' + CASE
+        self.assertTrue(any(issue.startswith('style:adjacent_marker') for issue in
+                            validate_letter(text, self.analysis, self.profile, plan=self.plan)))
+        self.assertEqual(self.normalize(text).count(ADJACENT_EXPERIENCE_PREFIX), 1)
+
     def test_employer_keyword_and_english_keep_the_required_format(self):
         text = 'Начните сопроводительное со слова «Зэд.».\n' + DESCRIPTION
         self.analysis = analyze_vacancy('AI Product Engineer', 'Тестовая компания', text)
@@ -78,6 +111,14 @@ class AdjacentExperienceLetters(unittest.TestCase):
         self.analysis = analyze_vacancy('AI Product Engineer', 'Company', 'Write the cover letter in English. ' + DESCRIPTION)
         result = self.normalize('I developed delivery integrations and request validation.')
         self.assertNotIn(ADJACENT_EXPERIENCE_PREFIX, result)
+
+    def test_opening_questions_keep_priority_and_do_not_require_the_ordinary_marker(self):
+        self.analysis = replace(self.analysis, opening_questions=('Опишите релевантную задачу.',))
+        self.plan = replace(self.plan, analysis=self.analysis)
+        text = '1. Настраивал валидацию заявок и обработку ошибок служб доставки.'
+        self.assertEqual(self.normalize(text), text)
+        self.assertFalse(any(issue.startswith('style:adjacent_marker') for issue in
+                             validate_letter(text, self.analysis, self.profile, plan=self.plan)))
 
     def test_profile_aliases_recognize_only_the_confirmed_ai_workflow_skills(self):
         for name in ('Cursor', 'OpenAI Codex', 'prompt-engineering', 'промпт-инжиниринг', 'ИИ-инструменты'):
@@ -109,6 +150,19 @@ class AdjacentExperienceLetters(unittest.TestCase):
                                             'Тестовая компания', DESCRIPTION, 1600, vacancy_id='fixture-ai-product')
                 self.assertEqual(result.count(ADJACENT_EXPERIENCE_PREFIX), 1, result)
                 self.assertNotRegex(result, r'(?i)внедрил[^.]*LLM|обучал[^.]*модел|создал[^.]*RAG')
+
+    def test_public_generation_keeps_concrete_action_and_labels_its_adjacent_case(self):
+        for action in ('Настраивал валидацию заявок и обработку ошибок служб доставки.',
+                       'Работал над согласованием курьерских отправлений и обработкой ошибок.',
+                       'Писал код валидации заявок и обработки ошибок служб доставки.'):
+            with self.subTest(action=action):
+                model = StubModel([action + '\n\n' + WORKFLOW])
+                model.profile = self.profile
+                result = model.write_letter(RESUME, '', 'Product Engineer / AI Product Engineer',
+                                            'Тестовая компания', DESCRIPTION, 1600)
+                self.assertEqual(result.count(ADJACENT_EXPERIENCE_PREFIX), 1, result)
+                self.assertIn(action[0].lower() + action[1:], result)
+                self.assertNotIn('style:adjacent_marker', ' '.join(model.last_letter_record['validation_issues']))
 
 
 if __name__ == '__main__':

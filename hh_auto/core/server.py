@@ -408,6 +408,8 @@ class ServerRunner:
         return ran
 
     def status(self, cfg: Config) -> dict:
+        from ..ai.client import PROMPT_VERSION
+
         now = self.now()
         next_slot = next_response_slot(cfg, now, self.state.responses)
         due = due_response_slots(cfg, now, self.state.responses, self.catch_up_minutes)
@@ -444,6 +446,8 @@ class ServerRunner:
             if "target" in record and "applied" in record:
                 runs[key]["remaining"] = max(0, record["target"] - record["applied"])
         return {"now": now.isoformat(), "timezone": self.timezone_name, "headless": True,
+                "prompt_version": PROMPT_VERSION, "letter_mode": cfg.letter.mode,
+                "ai_letter_requires_verified_text": cfg.letter.mode == "ai",
                 "schedule_enabled": cfg.schedule.enabled, "times": cfg.schedule.times, "days": cfg.schedule.days,
                 "catch_up_minutes": self.catch_up_minutes,
                 "responses_due": [slot.isoformat() for slot in due],

@@ -35,6 +35,7 @@ jobs:
           python tests/e2e_server_mode.py
           python tests/e2e_application_retry.py
           python tests/e2e_setup.py
+          python tests/test_chat_action_scope.py --browser
       - name: Build server image
         run: |
           docker build -f docker/Dockerfile -t hh-auto-response:ci .

@@ -201,7 +201,7 @@ class ReplyDelayTests(unittest.TestCase):
         self.now = 1000.0
         self.ai = Mock(notes=[])
         self.ai.decide.return_value = Decision("question", self.transcript, "Москва.")
-        self.page = Mock()
+        self.page = Mock(url=f"https://hh.ru/chat/{self.chat.id}")
         self.patches = [patch.object(chats.time, "time", side_effect=lambda: self.now),
                         patch.object(chats, "_current_sender", return_value=self.robot),
                         patch.object(chats, "_transcript", return_value=self.transcript),

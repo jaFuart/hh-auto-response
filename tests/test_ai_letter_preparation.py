@@ -30,6 +30,9 @@ class PrepareBeforeApply(unittest.TestCase):
         self.fetch = patch("hh_auto.hh.responder.fetch_vacancy_text", return_value="Полное описание вакансии")
         self.fetch_mock = self.fetch.start()
         self.addCleanup(self.fetch.stop)
+        self.status = patch.object(self.responder, "application_status", return_value="not_applied")
+        self.status.start()
+        self.addCleanup(self.status.stop)
 
     def test_api_error_fails_safely_before_apply_without_template_fallback(self):
         self.ai.write_letter.side_effect = AiError("API недоступен")

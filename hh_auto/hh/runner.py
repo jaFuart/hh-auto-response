@@ -329,7 +329,8 @@ def run(
             log.info("  очередь: попытка уже началась или повтор запрещён — без клика")
             return True
         try:
-            result = responder.apply_on_vacancy(vac) if opts.retry_only or durable_pacing else responder.apply(vac)
+            result = (responder.apply_on_vacancy(vac)
+                      if opts.retry_only or durable_pacing or cfg.letter.mode == "ai" else responder.apply(vac))
         except WorkDeferred:
             if delivery:
                 delivery.record_result(resume_id, vac.id, confirmed=False, outbound_attempted=responder.clicked,

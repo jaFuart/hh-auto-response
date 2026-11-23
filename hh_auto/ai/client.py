@@ -28,7 +28,7 @@ from .application import analyze_vacancy, make_letter_plan, validate_letter
 from .claims import personal_claim_issues
 from .language import candidate_gender_rule, normalize_candidate_text
 
-PROMPT_VERSION = "adjacent-ai-product-letters-2026-11-23"
+PROMPT_VERSION = "verified-ai-letter-2026-11-23"
 
 KINDS = ("question", "info", "human", "wait")
 
@@ -547,6 +547,51 @@ def norm(text: str) -> str:
     return " ".join(text.lower().split())
 
 
+_CHAT_HARD_ACTION_LABEL = re.compile(
+    r"отклик|приглаш|оффер|сопровод|cover\s*letter|\b(?:apply|accept|submit|send|confirm|join)\b|"
+    r"\b(?:отправить|принять|согласиться|подтвердить|подать\s+заявк\w*)\b", re.I)
+_CHAT_INTERVIEW_ACTION_LABEL = re.compile(
+    r"\b(?:интересно|интересна|интересен|интересует|заинтересова\w*|начать|начн[её]м|приступить|продолжить|"
+    r"interested|start|begin|continue|proceed)\b", re.I)
+_CHAT_HARD_ACTION_REQUEST = re.compile(
+    r"\b(?:откликнитесь|откликнуться|принять\s+приглашение|подать\s+заявк\w*|"
+    r"отправить\s+(?:резюме|отклик|заявк\w*))\b|"
+    r"\b(?:принять|принимаете|согласны|подтвердите)\b[^?!.]{0,50}\b(?:приглаш\w*|оффер\w*)\b|"
+    r"\bapply\s+(?:for|to)\b|\baccept\b[^?!.]{0,30}\binvitation\b", re.I)
+_CHAT_INTERVIEW_REQUEST = re.compile(
+    r"(?:^|\n)\s*(?:давайте\s+)?(?:начать|начн[её]м|продолжить|продолжим)\b|"
+    r"\bнажмите\b[^?!.]{0,40}\b(?:начать|продолжить)\b|"
+    r"(?:^|\n)\s*(?:вам\s+|вас\s+)?(?:интересно|заинтересовало)\s*[?!]|"
+    r"\b(?:интересна|интересен|интересно|интересует|заинтересовал\w*)\b[^?!.]{0,100}\b(?:ваканси\w*|предложени\w*)\b|"
+    r"\b(?:ваканси\w*|предложени\w*)\b[^?!.]{0,100}\b(?:интересна|интересен|интересует|заинтересовал\w*)\b|"
+    r"\b(?:готовы|хотите|давайте|можем|нажмите)\b[^?!.]{0,80}\b(?:начать|начн[её]м|приступить|пройти|запустить)\b"
+    r"[^?!.]{0,80}\b(?:анкет\w*|опрос\w*|отбор\w*|собеседовани\w*|интервью|скрининг\w*|тест\w*)\b|"
+    r"\binterested\b[^?!.]{0,80}\b(?:vacancy|position|job)\b|"
+    r"\b(?:start|begin|continue)\b[^?!.]{0,80}\b(?:questionnaire|screening|interview)\b",
+    re.I)
+
+
+def chat_action_request(question: str, *, existing_application: bool = False) -> bool:
+    """An application, invitation, or screening-start action needs the application workflow."""
+    if _CHAT_HARD_ACTION_REQUEST.search(question):
+        return True
+    if (re.search(r"\b(?:почему|чем|что\s+(?:именно\s+)?вас)\b", question, re.I)
+            and not re.search(r"отклик|приглаш|\b(?:начать|пройти|запустить|приступить)\b", question, re.I)):
+        return False
+    return bool(_CHAT_INTERVIEW_REQUEST.search(question)) and existing_application is not True
+
+
+def safe_chat_button(text: str, question: str, *, existing_application: bool = False) -> bool:
+    """A short option must answer an explicit question and cannot initiate an application action."""
+    return bool(text.strip() and len(text.strip()) <= 80 and not _CHAT_HARD_ACTION_LABEL.search(text)
+                and (not _CHAT_INTERVIEW_ACTION_LABEL.search(text) or existing_application is True)
+                and not chat_action_request(question, existing_application=existing_application)
+                and ("?" in question or re.search(
+                    r"\b(?:выберите|укажите|отметьте|подтвердите|назовите)\b", question, re.I)
+                     or existing_application is True and re.search(
+                         r"\b(?:нажмите|начать|начн[её]м|продолжить|продолжим|start|begin|continue)\b", question, re.I)))
+
+
 def ours_is_last(transcript: str, last_sent: str) -> bool:
     """Переписка заканчивается нашим ответом: после него только время и подписи («Вы», «прочитано»)."""
     text, probe = norm(transcript), norm(last_sent)[:60]
@@ -706,7 +751,7 @@ MEETING = re.compile(r"собеседовани|интервью|созвон|з
                      r"zoom|телемост|google meet|удобн\w* (?:время|дат|день)|слот", re.I)
 
 
-def review(decision: Decision, transcript: str, sent: list[str]) -> str:
+def review(decision: Decision, transcript: str, sent: list[str], *, existing_application: bool = False) -> str:
     """Проверяет решение модели страховками. Может поменять decision.kind. Возвращает пояснение или "".
 
     Модель может ошибиться, поэтому правила ниже работают всегда:
@@ -725,8 +770,15 @@ def review(decision: Decision, transcript: str, sent: list[str]) -> str:
         decision.kind = "human"
         return f"в сообщении «{sensitive.group(0)}» — такие вопросы решаете вы"
     meeting = MEETING.search(tail) or (MEETING.search(decision.question) if decision.question else None)
+    screening = tail + "\n" + decision.question
+    ongoing_screening = (existing_application is True and _CHAT_INTERVIEW_REQUEST.search(screening)
+                         and not _CHAT_HARD_ACTION_REQUEST.search(screening)
+                         and not re.search(r"созвон|звонок|позвон|встреч|zoom|телемост|google meet|"
+                                           r"\b(?:завтра|сегодня|время|дат[ауы]|понедельник|вторник|сред[ау]|"
+                                           r"четверг|пятниц\w*|суббот\w*|воскресен\w*)\b|\d{1,2}[:.]\d{2}",
+                                           screening, re.I))
     # «Готовы ли вы после интервью предоставить документы?» — про документы, а не приглашение на интервью
-    if meeting and decision.kind != "human" and not documents_question(tail):
+    if meeting and decision.kind != "human" and not documents_question(tail) and not ongoing_screening:
         decision.kind = "human"
         return f"предлагают {meeting.group(0)} — время согласуете вы"
     if decision.kind in ("info", "wait") and tail.rstrip().endswith("?"):
@@ -1025,7 +1077,8 @@ class AiClient:
         return parse_verdict(self.complete(messages, max_tokens=512, json_mode=True))
 
     def build_messages(self, resume: str, context: str, transcript: str, sent: list[str] | None = None,
-                       focus: str = "", buttons: list[str] | None = None) -> list[dict]:
+                       focus: str = "", buttons: list[str] | None = None,
+                       *, existing_application: bool = False) -> list[dict]:
         """Ровно то, что уходит нейросети: инструкция + резюме + контекст + переписка + новые сообщения.
         focus — один конкретный вопрос (когда работодатель задал несколько подряд)."""
         context = self._candidate_context(context, query=focus or "\n".join(new_messages(transcript, sent or [])))
@@ -1037,13 +1090,25 @@ class AiClient:
             f"ПЕРЕПИСКА (последние сообщения внизу):\n{transcript}",
             "НОВЫЕ СООБЩЕНИЯ РАБОТОДАТЕЛЯ (реши, что с ними делать):\n" + "\n".join(fresh or [last_message(transcript)]),
         ]
+        if existing_application is True:
+            parts.append("ПРОВЕРКА ИНТЕРФЕЙСА: в этом точном чате подтверждён ранее отправленный отклик. "
+                         "Можно начать или продолжить существующую анкету робота, подтвердить интерес к ней. "
+                         "Создавать новый отклик, принимать новое приглашение и добавлять письмо запрещено.")
         if buttons:
             parts.append(
                 "КНОПКИ ОТВЕТА В ЧАТЕ:\n" + "\n".join(f"- {b}" for b in buttons) + "\n"
-                'Если одна кнопка прямо отвечает на новый вопрос (варианты «Да»/«Нет», «Интересно», выбор из списка, '
-                'ответ на приглашение hh — тогда кнопка с интересом/согласием), добавь в JSON поле "button" с ТОЧНЫМ '
+                'Если одна кнопка прямо отвечает на текущий вопрос анкеты (варианты «Да»/«Нет», выбор из списка), '
+                'добавь в JSON поле "button" с ТОЧНЫМ '
                 'текстом кнопки, а kind = "question". Кнопки-подсказки с готовыми фразами соискателя '
                 '(«Здравствуйте!», «Какая схема оплаты?», «У меня есть профильный опыт») не выбирай. '
+                'Не создавай отклик, не принимай приглашение и не добавляй сопроводительное. '
+                '«Откликнуться», «Принять приглашение» и «Добавить сопроводительное» требуют kind = "human". '
+                + ('«Начать», «Продолжить», «Да, интересно» допустимы только как ответ на текущий вопрос '
+                   'существующей анкеты робота, потому что интерфейс подтвердил прежний отклик. '
+                   if existing_application is True else
+                   'Прежний отклик интерфейсом не подтверждён: «Интересно», «Начать», «Продолжить» '
+                   'и подобные действия требуют kind = "human". ')
+                +
                 'Ни одна не подходит — поле "button" не добавляй.')
         if focus:
             parts.append(f"СЕЙЧАС ОТВЕТЬ ТОЛЬКО НА ЭТОТ ВОПРОС:\n{focus}")
@@ -1055,23 +1120,29 @@ class AiClient:
         return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
     def decide(self, resume: str, context: str, transcript: str, sent: list[str],
-               buttons: list[str] | None = None) -> Decision:
+               buttons: list[str] | None = None, *, existing_application: bool = False) -> Decision:
         """Automatic ordinary answers, with source-backed recovery and reviewable diagnostics."""
         fresh = "\n".join(new_messages(transcript, sent))
         self.notes = []
         self.last_raw = ""
         technical = ""
-        if not buttons and self._closed_skill_confirmation(fresh, resume, context):
+        existing_application = existing_application is True
+        action_requested = chat_action_request(fresh, existing_application=existing_application)
+        if action_requested:
+            decision = Decision("human", fresh)
+            self.notes.append("Действие отклика, приглашения или запуска анкеты оставлено человеку")
+        elif not buttons and self._closed_skill_confirmation(fresh, resume, context):
             decision = Decision("question", fresh, "Да.")
             self.notes.append("Короткое подтверждение явно известной компетенции")
         else:
             try:
-                decision = self._decide(resume, context, transcript, sent, buttons)
+                decision = self._decide(resume, context, transcript, sent, buttons,
+                                        **({"existing_application": True} if existing_application else {}))
             except AiError as error:
                 technical = str(error)[:300]
                 decision = Decision("human", fresh)
         profile = getattr(self, "profile", None)
-        protected = (SENSITIVE.search(fresh) or MEETING.search(fresh) or documents_question(fresh)
+        protected = (action_requested or SENSITIVE.search(fresh) or MEETING.search(fresh) or documents_question(fresh)
                      or _ATTACH_NOW.search(fresh) or re.search(
                          r"(?:вы|ты)\s+(?:не\s+)?(?:бот|нейросет|человек)|"
                          r"(?:отвечает|пишет)\s+(?:за\s+вас\s+)?(?:бот|нейросет|ии)|"
@@ -1103,11 +1174,16 @@ class AiClient:
                 self.notes.append("Односложный ответ дополнен конкретикой подтверждённого примера")
         if ordinary and decision.kind == "question" and not decision.button:
             decision.reply = self._guard_bare_skill_answer(question, decision.reply, resume, context)
+        if decision.button and (not any(norm(option) == norm(decision.button) for option in buttons or [])
+                                or not safe_chat_button(decision.button, fresh, existing_application=existing_application)):
+            decision = Decision("human", question)
+            self.notes.append("Кнопка не доказана как безопасный ответ на текущий вопрос анкеты")
         decision.reply = normalize_candidate_text(decision.reply, self.cfg)
         self.last_chat_record = {
             "prompt_version": PROMPT_VERSION, "model": self.model, "question": question,
             "final_text": decision.reply, "kind": decision.kind, "validation_notes": list(self.notes),
             "technical_note": technical, "requires_approval": False,
+            "existing_application": existing_application,
             "profile_schema_version": getattr(profile, "schema_version", ""),
             "profile_updated_at": getattr(profile, "updated_at", ""),
         }
@@ -1184,7 +1260,7 @@ class AiClient:
         return self._experience_fallback(question, resume, context)
 
     def _decide(self, resume: str, context: str, transcript: str, sent: list[str],
-                buttons: list[str] | None = None) -> Decision:
+                buttons: list[str] | None = None, *, existing_application: bool = False) -> Decision:
         context = self._candidate_context(context, query="\n".join(new_messages(transcript, sent)))
         if is_done_message(transcript):  # завершение анкеты узнаём сами — без нейросети
             self.last_raw = ""
@@ -1200,7 +1276,8 @@ class AiClient:
             if len([m for m in fresh if m.rstrip().endswith("?")]) <= 1:
                 button = next((b for b in buttons if _YES_OPTION.search(b) and not _NO_OPTION.search(b)), "")
                 return Decision("question", about_documents[0], "" if button else DOCUMENTS_REPLY, button)
-        messages = self.build_messages(resume, context, transcript, sent, buttons=buttons)
+        messages = self.build_messages(resume, context, transcript, sent, buttons=buttons,
+                                       existing_application=existing_application)
         self.last_raw = self.complete(messages, json_mode=True)
         try:
             decision = self._parse(self.last_raw)
@@ -1235,7 +1312,8 @@ class AiClient:
             decision.reply = ""
             replies = []
             for question in questions:
-                focused = self.build_messages(resume, context, transcript, sent, focus=question, buttons=buttons)
+                focused = self.build_messages(resume, context, transcript, sent, focus=question, buttons=buttons,
+                                              existing_application=existing_application)
                 try:
                     self.last_raw = self.complete(focused, json_mode=True)
                     part = self._fix_reply(self._parse(self.last_raw), focused, resume, context)
@@ -1249,13 +1327,14 @@ class AiClient:
                 decision.kind = "human"
                 return decision
         if decision.kind == "question" and decision.reply and not decision.button:
-            decision = self._check_on_topic(decision, resume, context, transcript, sent, buttons)
+            decision = self._check_on_topic(decision, resume, context, transcript, sent, buttons,
+                                            **({"existing_application": True} if existing_application else {}))
         if decision.kind == "question":
             decision.reply = concise_answer(decision.reply)
         return decision
 
     def _check_on_topic(self, decision: Decision, resume: str, context: str, transcript: str, sent: list[str],
-                        buttons: list[str]) -> Decision:
+                        buttons: list[str], *, existing_application: bool = False) -> Decision:
         """Отвечает ли ответ по существу на вопрос. Нет — переспрашиваем с фокусом на вопрос, снова мимо — человеку."""
         for attempt in range(2):
             ok = not _generic_reply_to_open_question(decision.question, decision.reply) and self._on_topic(
@@ -1265,7 +1344,8 @@ class AiClient:
             self.notes.append(f"ответ не по сути вопроса: «{decision.reply[:60]}»")
             if attempt:
                 break
-            focused = self.build_messages(resume, context, transcript, sent, focus=decision.question, buttons=buttons)
+            focused = self.build_messages(resume, context, transcript, sent, focus=decision.question, buttons=buttons,
+                                          existing_application=existing_application)
             focused[-1]["content"] += ("\n\nПрошлый ответ не отвечал на вопрос по существу. Ответь именно на него, "
                                        "по подтверждённым фактам резюме, профиля и уточнений. Не требуй от себя "
                                        "выдумать конкретное внедрение: раскрывай реальный релевантный опыт.")

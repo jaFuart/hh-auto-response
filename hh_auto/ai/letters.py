@@ -7,7 +7,8 @@ from datetime import datetime, timezone
 import json
 import re
 
-from .application import (RUSSIAN_LETTER_ASSESSMENT, RUSSIAN_LETTER_GREETING, _project_aliases, _SKILLS,
+from .application import (RUSSIAN_LETTER_ASSESSMENT, RUSSIAN_LETTER_GREETING, ADJACENT_EXPERIENCE_PREFIX,
+                          LetterPlan, _ADJACENT_MARKER, _project_aliases, _SKILLS,
                           _case_mentioned, _skills, analyze_vacancy, make_letter_plan, validate_letter)
 from .claims import fact_judge_messages, personal_claim_issues
 from .language import candidate_gender_rule, normalize_candidate_text
@@ -191,20 +192,14 @@ def _natural_paragraphs(body, protected_keywords=()):
     return result
 
 
-ADJACENT_EXPERIENCE_PREFIX = "Из смежного опыта:"
-
-
-def _adjacent_case_paragraphs(paragraphs, plan):
+def _adjacent_case_paragraphs(paragraphs: list[str], plan: LetterPlan) -> list[str]:
     """Label a sourced adjacent case once; never manufacture an empty experience heading."""
     adjacent = [project for project in plan.selected_projects if project.get('relation') == 'adjacent']
-    if not adjacent:
-        return paragraphs
-    marker = re.compile(r"\bИз\s+смежного\s+опыта\s*[:—–-]?\s*", re.I)
     result, labelled = [], False
     for paragraph in paragraphs:
+        paragraph = _ADJACENT_MARKER.sub('', paragraph).strip()
         matches_case = any(_case_mentioned(paragraph, (), (project,)) for project in adjacent)
         if matches_case:
-            paragraph = marker.sub('', paragraph).strip()
             if not labelled:
                 paragraph = re.sub(r'^[А-ЯЁ]', lambda match: match[0].lower(), paragraph)
                 paragraph = ADJACENT_EXPERIENCE_PREFIX + ' ' + paragraph

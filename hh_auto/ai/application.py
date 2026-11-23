@@ -666,6 +666,24 @@ def _project_aliases(name: str) -> tuple[str, ...]:
     return _unique(alias for alias in aliases if len(alias.strip()) >= 4)
 
 
+_CASE_CONTRIBUTION = re.compile(
+    r"\b(?:(?:разрабатывал|внедрял|создавал|реализовал|реализовывал|разработал|"
+    r"автоматизировал|настроил|настраивал|работал|писал)(?:а|и)?|разрабатываю|настраиваю|работаю|пишу|"
+    r"implemented|developed|built|created|automated|configured|worked|wrote)\b", re.I)
+_AI_WORKFLOW = re.compile(r"\bCursor\b|\b(?:OpenAI\s+)?Codex\b|\bprompt[- ]?engineering\b|"
+                          r"промпт|ИИ[- ]?(?:инструмент|ассистент)|AI[- ]assisted", re.I)
+
+
+def _project_case_text(text: str, project: Mapping[str, Any]) -> str:
+    evidence = " ".join((str(project.get("description", "")), *project.get("tasks", ()),
+                         *project.get("personal_technologies", ())))
+    if _AI_WORKFLOW.search(text) and not _AI_WORKFLOW.search(evidence):
+        # Current assistant use does not establish a historical project contribution.
+        return " ".join(sentence for sentence in re.split(r"(?<=[.!?])\s+|\n+", text)
+                        if not _AI_WORKFLOW.search(sentence))
+    return text
+
+
 def _case_mentioned(text: str, project_names: Iterable[str], projects: Iterable[Mapping[str, Any]] = ()) -> bool:
     normal = re.sub(r"[^\w]+", " ", _norm(text))
     for name in project_names:
@@ -673,16 +691,18 @@ def _case_mentioned(text: str, project_names: Iterable[str], projects: Iterable[
             alias = re.sub(r"[^\w]+", " ", _norm(alias)).strip()
             if alias and re.search(r"(?<!\w)" + re.escape(alias) + r"(?!\w)", normal):
                 return True
-    contribution = re.search(r"разрабатывал|внедрял|создавал|реализовал|разработал|автоматизировал|настроил|"
-                             r"implemented|developed|built|created|automated", text, re.I)
+    contribution = _CASE_CONTRIBUTION.search(text)
     if contribution:
         ignored = {"python", "данных", "данные", "работа", "проект", "сервис", "система", "задачи", "backend"}
         def case_tokens(value):
             return {word[:6] for word in re.findall(r"[a-zа-яё][\w]{3,}", _norm(value)) if word not in ignored}
-        current = case_tokens(text)
         for project in projects:
             evidence = " ".join((str(project.get("description", "")), *project.get("tasks", ())))
-            if re.search(r"маркетплейс|marketplace", text, re.I) and not re.search(
+            case_text = _project_case_text(text, project)
+            if not _CASE_CONTRIBUTION.search(case_text):
+                continue
+            current = case_tokens(case_text)
+            if re.search(r"маркетплейс|marketplace", case_text, re.I) and not re.search(
                     r"маркетплейс|marketplace", evidence + " " + str(project.get("name", "")), re.I):
                 continue
             if len(current & case_tokens(evidence)) >= 3:
@@ -694,22 +714,21 @@ def _case_mentioned(text: str, project_names: Iterable[str], projects: Iterable[
                 r"ipfs|распредел[её]н.{0,20}хран|distributed.storage|cluster",
                 r"прогноз|временн.{0,15}ряд|forecast|time.series|bert|lstm",
             )
-            if any(re.search(theme, evidence, re.I) and re.search(theme, text, re.I) for theme in themes):
+            if any(re.search(theme, evidence, re.I) and re.search(theme, case_text, re.I) for theme in themes):
                 return True
     # A real case may be described by its domain instead of its registry heading.
     # Require the domain in the source AND a concrete past contribution in the letter;
     # a generic SQL/API mention or interest in the employer's product is insufficient.
-    marketplace_case = any(re.search(
+    marketplace_cases = [project for project in projects if re.search(
         r"(?:marketplace|маркетплейс).{0,60}(?:analyt|аналит|прогноз)|"
         r"(?:analyt|аналит|прогноз).{0,60}(?:marketplace|маркетплейс)",
-        _norm(str(project.get("name", "")) + " " + str(project.get("description", ""))), re.I)
-        for project in projects)
-    if marketplace_case:
+        _norm(str(project.get("name", "")) + " " + str(project.get("description", ""))), re.I)]
+    for project in marketplace_cases:
+        case_text = _project_case_text(text, project)
         case = re.search(r"(?:проект[а-я]*|сервис[а-я]*|приложени[а-я]*)[^.!?\n]{0,100}"
                          r"аналитик[а-я]*[^.!?\n]{0,35}маркетплейс[а-я]*|"
-                         r"(?:project|service|application)[^.!?\n]{0,80}marketplace analytics", text, re.I)
-        if case and re.search(r"разрабатывал|внедрял|создавал|реализовал|разработал|автоматизировал|"
-                              r"worked|built|developed|implemented", text[max(0, case.start() - 60):case.end() + 160], re.I):
+                         r"(?:project|service|application)[^.!?\n]{0,80}marketplace analytics", case_text, re.I)
+        if case and _CASE_CONTRIBUTION.search(case_text[max(0, case.start() - 60):case.end() + 160]):
             return True
     return False
 
@@ -725,6 +744,23 @@ def _language_body(text: str, analysis: ApplicationAnalysis, project_names: Iter
         pattern = r"\s+".join(re.escape(part) for part in name.split())
         body = re.sub(pattern, " ", body, flags=re.I)
     return body
+
+
+def _adjacent_marker_issues(text: str, analysis: ApplicationAnalysis, plan: LetterPlan) -> list[str]:
+    if (analysis.language != "ru" or analysis.opening_questions
+            or analysis.word_limit and analysis.word_limit < 35):
+        return []
+    adjacent = tuple(project for project in plan.selected_projects if project.get("relation") == "adjacent")
+    paragraphs = re.split(r"\n\s*\n", text)
+    cases = [paragraph for paragraph in paragraphs if _case_mentioned(paragraph, (), adjacent)] if adjacent else []
+    markers = list(_ADJACENT_MARKER.finditer(text))
+    if cases:
+        labelled = any(paragraph.lstrip().startswith(ADJACENT_EXPERIENCE_PREFIX) for paragraph in cases)
+        if len(markers) != 1 or not labelled:
+            return ["style:adjacent_marker — перед подтверждённым смежным кейсом нужна ровно одна фраза «Из смежного опыта:»"]
+    elif markers:
+        return ["style:adjacent_marker — пометка смежного опыта должна относиться к конкретному подтверждённому кейсу"]
+    return []
 
 
 _CLAIM_QUANTITY = re.compile(r"\b\d+(?:[.,]\d+)?(?:\s*[–-]\s*\d+(?:[.,]\d+)?)?\s*"
@@ -835,6 +871,7 @@ def validate_letter(text: str, analysis: ApplicationAnalysis, profile: Any = Non
             issues.append("objective:project — указан проект, отсутствующий в подтверждённых кейсах")
     if plan.selected_projects and not _case_mentioned(text, known_projects, known_project_items):
         issues.append("style:missing_case — опиши одну конкретную задачу подтверждённого релевантного кейса без собственных имён")
+    issues.extend(_adjacent_marker_issues(text, analysis, plan))
     if len(_skills(text)) > 7 and len(words) < 100:
         issues.append("style:stack_list — замени перечень технологий конкретным кейсом и его пользой")
     if re.search(r"готов быстро освоить|знаком базово|опыта.{0,15}не было", text, re.I):
@@ -867,4 +904,6 @@ def deduplicate_vacancies(records: Iterable[Mapping[str, Any]]) -> list[dict]:
     return result
 RUSSIAN_LETTER_GREETING = "Добрый день, очень заинтересовала данная вакансия!"
 RUSSIAN_LETTER_ASSESSMENT = "Считаю, что мои навыки и компетенции соответствуют описанию вакансии."
+ADJACENT_EXPERIENCE_PREFIX = "Из смежного опыта:"
+_ADJACENT_MARKER = re.compile(r"\bИз\s+смежного\s+опыта\s*[:—–-]?\s*", re.I)
 

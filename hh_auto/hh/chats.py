@@ -42,7 +42,8 @@ from playwright.sync_api import Error as PlaywrightError
 from ..core import control
 from ..web import selectors as S
 from ..web import browser
-from ..ai.client import AiClient, AiError, is_done_message, norm, ours_is_last, review
+from ..ai.client import (AiClient, AiError, chat_action_request, is_done_message, last_message,
+                         norm, ours_is_last, review, safe_chat_button)
 from ..web.auth import hh_role, is_auth_url
 from ..web.browser import FatalError, slowdown, wait_captcha
 from ..core.config import Config
@@ -156,7 +157,7 @@ _SENDER_JS = """
   if (!messages.length) messages = Array.from(panel.querySelectorAll(messageSelector)).filter(visible);
   const last = messages[messages.length - 1];
   if (!last) return null;
-  const ownSelector = '[class*="message-my--"], [class*="message-text-outgoing--"]';
+  const ownSelector = '[class*="message-my--"], [class*="message-text-outgoing--"], [class*="magritte-outgoing___"]';
   const botSelector = '[class*="magritte-bot___"]';
   const outgoing = last.matches(ownSelector) || !!last.querySelector(ownSelector);
   const robot = !outgoing && (last.matches(botSelector) || !!last.querySelector(botSelector));
@@ -172,35 +173,55 @@ _SENDER_JS = """
 """
 
 
-# Кнопки быстрого ответа в открытом чате («Да» / «Нет», «Интересно», ответ на приглашение hh…).
-# Берём видимые кнопки с текстом в области переписки, кроме шапки чата.
+# Только варианты ответа внутри последнего сообщения подтверждённого робота hh.
+# Кнопки шапки, приглашений и соседних панелей не считаются ответами на вопрос.
 _BUTTONS_JS = """
 ([inputSelector, cellSelector, sendSelector]) => {
-  const input = Array.from(document.querySelectorAll(inputSelector)).find((el) => el.offsetParent !== null);
-  if (!input) return [];
-  let el = input, best = input;
+  const visible = (el) => el && el.offsetParent !== null;
+  const inputs = Array.from(document.querySelectorAll(inputSelector)).filter(visible);
+  if (inputs.length !== 1) return null;
+  const input = inputs[0];
+  let el = input, panel = input;
   while (el.parentElement && el.parentElement !== document.body) {
     el = el.parentElement;
     if (el.querySelector(cellSelector)) break;
-    best = el;
+    panel = el;
   }
-  // строка ввода: ближайший к полю блок с кнопками — «Отправить», «Прикрепить» — это не ответы
-  let row = input;
-  while (row.parentElement && !row.parentElement.querySelector('button')) row = row.parentElement;
-  row = row.parentElement || row;
-  const tools = /^(отправить|прикрепить|send|attach|загрузить|файл|фото|эмодзи|emoji)$/i;
-  const top = best.getBoundingClientRect().top;
-  const seen = new Set(), out = [];
-  for (const b of best.querySelectorAll('button, [role="button"]')) {
-    if (!b.offsetParent || b.contains(input) || row.contains(b)) continue;
-    if (b.matches(sendSelector) || tools.test((b.innerText || '').trim())) continue;
+  const generic = '[data-qa="chatik-message"], [data-qa="chatik-message-container"], ' +
+    '[data-qa="chat-message"], [data-qa="chat-message-container"], [data-message-id]';
+  let messages = Array.from(panel.querySelectorAll('[data-qa^="chatik-chat-message-"]')).filter(
+    (node) => visible(node) && /^chatik-chat-message-[0-9]+$/.test(node.getAttribute('data-qa') || ''));
+  if (!messages.length) messages = Array.from(panel.querySelectorAll(generic)).filter(visible);
+  const ownSelector = '[class*="message-my--"], [class*="message-text-outgoing--"], [class*="magritte-outgoing___"]';
+  const existingApplication = messages.some((node) => {
+    if (!/^chatik-chat-message-[0-9]+$/.test(node.getAttribute('data-qa') || '')) return false;
+    const own = node.matches(ownSelector) ? node : node.querySelector(ownSelector);
+    if (!own) return false;
+    const title = own.querySelector('[data-qa="chat-bubble-message-title"]');
+    const label = (title?.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+    return /^отклик на вакансию[.!:]?$/.test(label);
+  });
+  const last = messages[messages.length - 1];
+  if (!last || last.matches('[class*="message-my--"], [class*="message-text-outgoing--"], [class*="magritte-outgoing___"]') ||
+      last.querySelector('[class*="message-my--"], [class*="message-text-outgoing--"], [class*="magritte-outgoing___"]') ||
+      !(last.matches('[class*="magritte-bot___"]') || last.querySelector('[class*="magritte-bot___"]'))) return null;
+  const qa = last.getAttribute('data-qa') || '';
+  const attribute = last.getAttribute('data-message-id') ? 'data-message-id' : last.id ? 'id' :
+    /^chatik-chat-message-[0-9]+$/.test(qa) ? 'data-qa' : '';
+  const messageId = attribute && last.getAttribute(attribute);
+  const chat = location.pathname.match(/^\\/chat\\/([^/]+)\\/?$/);
+  if (!messageId || !chat) return null;
+  const question = last.cloneNode(true);
+  question.querySelectorAll('button, [role="button"]').forEach((node) => node.remove());
+  const out = [];
+  for (const b of last.querySelectorAll('button, [role="button"]')) {
+    if (!visible(b) || b.matches(sendSelector) || b.closest('a[href], form[action]')) continue;
     const text = (b.innerText || '').trim();
-    if (!text || text.length > 80 || text.includes(String.fromCharCode(10)) || seen.has(text)) continue;
-    if (b.getBoundingClientRect().top < top + 90) continue;  // шапка чата: вакансия, меню
-    seen.add(text);
-    out.push(text);
+    if (text && text.length <= 80 && !text.includes(String.fromCharCode(10))) out.push(text);
   }
-  return out;
+  return {chat_id: decodeURIComponent(chat[1]), message_id: messageId, attribute,
+    question: question.innerText || question.textContent || '', buttons: out,
+    existing_application: existingApplication};
 }
 """
 
@@ -913,8 +934,10 @@ def _click_chat(page: Page, chat: _Chat, cfg: Config) -> None:
     cell.click()
     try:
         page.wait_for_url(re.compile(rf"/chat/{re.escape(chat.id)}(?:[/?#]|$)"), timeout=10_000)
-    except PlaywrightError:
-        log.debug(f"  адрес не сменился на /chat/{chat.id}: {page.url}")
+    except PlaywrightError as error:
+        raise PlaywrightError("после открытия hh не подтвердил точный ID чата — ответ отменён") from error
+    if not _chat_url_matches(page, chat.id, cfg.chats.url):
+        raise PlaywrightError("после открытия hh показал другой чат — ответ отменён")
 
 
 def _back_to_list(page: Page, cfg: Config | None = None) -> None:
@@ -974,10 +997,10 @@ def _handle_with_ai(page, chat: _Chat, cfg: Config, ai: AiClient, resume: str, s
     transcript = None
     try:
         _click_chat(page, chat, cfg)
-        transcript = _wait_transcript(page, chat, previous)
+        transcript = _wait_transcript(page, chat, previous, cfg=cfg)
         if transcript is None:
-            log.info("  в чате нет поля для ответа (чат закрыт работодателем) — просто прочитан")
-            stats.info_read += 1
+            log.info("  панель текущего чата не подтверждена или недоступна — оставляю чат вам")
+            _leave_to_you(stats, needs_you, chat.last)
         else:
             transcript = _converse(page, chat, cfg, ai, resume, stats, dry_run, answers_log, sent, transcript,
                                    needs_you)
@@ -1080,7 +1103,7 @@ def _turn_key(chat: _Chat, transcript: str, sender: _Sender | None) -> str:
 
 
 def _same_robot_turn(page: Page, cfg: Config, chat: _Chat, turn_key: str) -> bool:
-    if _chat_age_reason(chat):
+    if _chat_age_reason(chat) or not _chat_url_matches(page, chat.id, cfg.chats.url):
         return False
     sender = _current_sender(page)
     transcript = _transcript(page)
@@ -1124,6 +1147,10 @@ def _wait_robot_reply_slot(page: Page, cfg: Config, chat: _Chat, turn_key: str, 
 def _converse(page, chat: _Chat, cfg: Config, ai: AiClient, resume: str, stats: ChatStats, dry_run: bool,
               answers_log: Path, sent: list[str], transcript: str, needs_you: str) -> str:
     """Вопрос робота → ответ ИИ → ждём следующий вопрос, и так по кругу. Возвращает последнюю переписку."""
+    if not _chat_url_matches(page, chat.id, cfg.chats.url):
+        log.warning("  ! точный адрес чата не подтверждён — ответ не подготовлен")
+        _leave_to_you(stats, needs_you, chat.last)
+        return transcript
     if cfg.ai.only_robot and (not cfg.resume_id or not resume.strip()):
         log.warning("  ! нет выбранного резюме для автоответов роботу — оставляю чат вам")
         _leave_to_you(stats, needs_you, chat.last)
@@ -1164,10 +1191,20 @@ def _converse(page, chat: _Chat, cfg: Config, ai: AiClient, resume: str, stats: 
                         "новых отправок и вызовов ИИ не будет")
             break
         log.info("  … спрашиваю ИИ, что ответить")
+        initial_scope = _button_scope(page)
+        existing_application = bool(_scope_matches_turn(initial_scope, chat, sender)
+                                    and initial_scope.get("existing_application") is True)
+        current_question = initial_scope["question"] if _scope_matches_turn(initial_scope, chat, sender) else last_message(transcript)
+        if chat_action_request(current_question, existing_application=existing_application):
+            log.info("  запуск нового отклика/приглашения или неподтверждённой анкеты оставляю вам")
+            _leave_to_you(stats, needs_you, chat.last)
+            break
+        requires_existing_application = existing_application and chat_action_request(current_question)
         buttons = _buttons(page)
         if buttons:
             log.debug(f"  кнопки в чате: {buttons}")
-        decision = ai.decide(resume, cfg.ai.context, transcript[-6000:], list(context_sent), buttons)
+        decision = ai.decide(resume, cfg.ai.context, transcript[-6000:], list(context_sent), buttons,
+                             **({"existing_application": True} if existing_application else {}))
         generation = _generation_record(getattr(ai, "last_chat_record", {}))
         for fix in ai.notes:
             log.warning(f"  ! проверка: {fix}")
@@ -1175,9 +1212,22 @@ def _converse(page, chat: _Chat, cfg: Config, ai: AiClient, resume: str, stats: 
         # Одинаковый текст ответа допустим на новый вопрос робота с новым ID (например, он повторно
         # спрашивает город). Повторы старого сообщения уже отсеяны по ID, остальные страховки review нужны.
         review_sent = [] if cfg.ai.only_robot and is_robot and sender and sender.message_id else context_sent
-        note = review(decision, transcript, review_sent)
+        note = review(decision, transcript, review_sent,
+                      **({"existing_application": True} if existing_application else {}))
         if note:
             log.warning(f"  ! {note}")
+        if decision.button:
+            scope = _button_scope(page)
+            if (sender is None or not sender.provider_robot or not sender.message_id or not scope
+                    or scope["chat_id"] != chat.id or scope["message_id"] != sender.message_id
+                    or decision.button not in buttons or decision.button not in scope["buttons"]
+                    or not safe_chat_button(decision.button, scope["question"],
+                                            existing_application=scope.get("existing_application") is True)):
+                log.warning("  ! кнопка не доказана как ответ текущему роботу — оставляю чат вам")
+                _leave_to_you(stats, needs_you, chat.last)
+                break
+            requires_existing_application = requires_existing_application or not safe_chat_button(
+                decision.button, scope["question"])
         if decision.kind == "info":
             if is_done_message(transcript):
                 log.success("  ✓ робот завершил анкету — перехожу к следующему чату")
@@ -1205,6 +1255,10 @@ def _converse(page, chat: _Chat, cfg: Config, ai: AiClient, resume: str, stats: 
             log.info("  [dry-run] ответ не отправлен")
             _log_answer(answers_log, chat, decision.question, answer, sent=False, generation=generation)
             break
+        if not _chat_url_matches(page, chat.id, cfg.chats.url):
+            log.info("  адрес чата сменился во время подготовки ответа — отправка отменена")
+            _leave_to_you(stats, needs_you, chat.last)
+            break
         if cfg.ai.only_robot:
             # Пока отвечала нейросеть, разговор мог продолжить человек. Проверяем отправителя и сообщение
             # заново до кнопки отправки, а не доверяем прежней отметке робота на весь диалог.
@@ -1215,6 +1269,7 @@ def _converse(page, chat: _Chat, cfg: Config, ai: AiClient, resume: str, stats: 
             live_sender = _current_sender(page)
             live_transcript = _transcript(page)
             if (not _robot_sender(live_sender, cfg.ai.robot_markers) or not live_transcript
+                    or not _chat_url_matches(page, chat.id, cfg.chats.url)
                     or _turn_key(chat, live_transcript, live_sender) != turn_key):
                 log.info("  сообщение или отправитель сменились во время подготовки ответа — оставляю чат вам")
                 _leave_to_you(stats, needs_you, chat.last)
@@ -1223,17 +1278,28 @@ def _converse(page, chat: _Chat, cfg: Config, ai: AiClient, resume: str, stats: 
                 log.info("  сообщение или отправитель сменились во время паузы — ответ не отправлен")
                 _leave_to_you(stats, needs_you, chat.last)
                 break
+        if requires_existing_application and not _existing_application_for_turn(page, cfg, chat, sender):
+            log.info("  прежний отклик в текущем чате больше не подтверждён — отправка отменена")
+            _leave_to_you(stats, needs_you, chat.last)
+            break
         # Запись ДО отправки защищает и от сбоя подтверждения: неоднозначную доставку автоматически не повторяем.
         _log_answer(answers_log, chat, decision.question, answer, sent=False, turn_key=turn_key, pending=True,
                     generation=generation)
         handled_turns.add(turn_key)
-        guard = (lambda: _same_robot_turn(page, cfg, chat, turn_key)) if cfg.ai.only_robot else None
+        def guard():
+            same = (_same_robot_turn(page, cfg, chat, turn_key) if cfg.ai.only_robot
+                    else _chat_url_matches(page, chat.id, cfg.chats.url))
+            return same and (not requires_existing_application
+                             or _existing_application_for_turn(page, cfg, chat, sender))
         try:
             if cfg.ai.only_robot:
-                delivered = (_press(page, decision.button, guard=guard) if decision.button
+                delivered = (_press(page, decision.button, guard=guard, chat_id=chat.id,
+                                    message_id=sender.message_id if sender else "", chat_url=cfg.chats.url) if decision.button
                              else _send(page, decision.reply, guard=guard))
             else:
-                delivered = _press(page, decision.button) if decision.button else _send(page, decision.reply)
+                delivered = (_press(page, decision.button, chat_id=chat.id,
+                                    message_id=sender.message_id if sender else "", chat_url=cfg.chats.url,
+                                    guard=guard) if decision.button else _send(page, decision.reply, guard=guard))
         except _SendNotAttempted as e:
             _log_answer(answers_log, chat, decision.question, answer, sent=False, turn_key=turn_key, released=True,
                         generation=generation)
@@ -1273,15 +1339,20 @@ def _transcript(page: Page) -> str | None:
         return None
 
 
-def _wait_transcript(page: Page, chat: _Chat, previous: str = "", timeout: float = 8) -> str | None:
+def _wait_transcript(page: Page, chat: _Chat, previous: str = "", timeout: float = 8,
+                     *, cfg: Config | None = None) -> str | None:
     """Переписка только что открытого чата. Сразу после щелчка панель ещё может показывать прошлый чат,
     а сообщения — догружаться: раньше бралось то, что было на экране через 0,8 с, и ИИ мог отвечать по чужой
-    переписке. Ждём, пока текст перестанет меняться и будет этим чатом: его вакансия в шапке (или прошло
-    3 с) и не переписка прошлого чата. Поля для ответа нет — None (чат закрыт работодателем)."""
+    переписке. Ждём точный URL, название вакансии и стабильный текст новой панели.
+    Неизвестная или старая панель не разрешает ответ по истечении таймера."""
     title = norm(chat.title)[:40]
+    if not title:
+        return None
     started = time.monotonic()
     last, stable_since = None, started
     while time.monotonic() - started < timeout:
+        if not _chat_url_matches(page, chat.id, cfg.chats.url if cfg else "https://hh.ru/chat"):
+            return None
         text = _transcript(page)
         now = time.monotonic()
         if not text or not text.strip():
@@ -1289,10 +1360,10 @@ def _wait_transcript(page: Page, chat: _Chat, previous: str = "", timeout: float
         elif text != last:
             last, stable_since = text, now
         elif (now - stable_since >= 0.6 and text != previous
-              and (not title or title in norm(text) or now - started >= 3)):
+              and title in norm(text)):
             return text
         control.sleep(0.3)
-    return last if last and last != previous else None
+    return None
 
 
 def _wait_next_message(page: Page, timeout: float, last_sent: str) -> str | None:
@@ -1353,33 +1424,80 @@ def _settled(page: Page, text: str, quiet: float = 1.5, limit: float = 6) -> str
     return text
 
 
-def _buttons(page: Page) -> list[str]:
+def _button_scope(page: Page) -> dict | None:
     try:
-        return page.evaluate(_BUTTONS_JS, [S.CHAT_INPUT, S.CHAT_CELL, S.CHAT_SEND]) or []
+        scope = page.evaluate(_BUTTONS_JS, [S.CHAT_INPUT, S.CHAT_CELL, S.CHAT_SEND])
     except PlaywrightError:
-        return []
+        return None
+    if (not isinstance(scope, dict) or scope.get("attribute") not in {"data-qa", "data-message-id", "id"}
+            or not all(isinstance(scope.get(key), str) and scope[key] for key in ("chat_id", "message_id", "question"))
+            or not isinstance(scope.get("buttons"), list) or not all(isinstance(text, str) for text in scope["buttons"])):
+        return None
+    return scope
 
 
-def _press(page: Page, text: str, *, guard: Callable[[], bool] | None = None) -> bool:
-    """Нажать кнопку быстрого ответа с ровно таким текстом и дождаться, что переписка изменилась."""
+def _scope_matches_turn(scope: dict | None, chat: _Chat, sender: _Sender | None) -> bool:
+    return bool(scope and sender and sender.provider_robot and not sender.outgoing and sender.message_id
+                and scope["chat_id"] == chat.id and scope["message_id"] == sender.message_id)
+
+
+def _existing_application_for_turn(page: Page, cfg: Config, chat: _Chat, sender: _Sender | None) -> bool:
+    if not _chat_url_matches(page, chat.id, cfg.chats.url):
+        return False
+    scope = _button_scope(page)
+    return bool(_scope_matches_turn(scope, chat, sender) and scope.get("existing_application") is True)
+
+
+def _buttons(page: Page) -> list[str]:
+    scope = _button_scope(page)
+    return list(dict.fromkeys(text for text in scope["buttons"] if safe_chat_button(
+        text, scope["question"], existing_application=scope.get("existing_application") is True))) if scope else []
+
+
+def _press(page: Page, text: str, *, guard: Callable[[], bool] | None = None,
+           chat_id: str = "", message_id: str = "", chat_url: str = "https://hh.ru/chat") -> bool:
+    """Нажать единственную кнопку ответа только внутри текущего сообщения робота hh."""
     before = _transcript(page) or ""
-    button = page.locator('button, [role="button"]').filter(
+    scope = _button_scope(page)
+    if (not scope or text not in scope["buttons"] or not safe_chat_button(
+            text, scope["question"], existing_application=scope.get("existing_application") is True)
+            or chat_id and scope["chat_id"] != chat_id or message_id and scope["message_id"] != message_id
+            or not _chat_url_matches(page, scope["chat_id"], chat_url)):
+        raise _SendNotAttempted("кнопка не доказана как безопасный ответ в текущем сообщении робота")
+    selector = f'[{scope["attribute"]}={json.dumps(scope["message_id"])}]'
+    message = page.locator(selector).filter(visible=True)
+    if message.count() != 1:
+        raise _SendNotAttempted("область текущего сообщения робота неоднозначна")
+    button = message.locator('button, [role="button"]').filter(
         has_text=re.compile(rf"^\s*{re.escape(text)}\s*$")).filter(visible=True)
-    if not button.count():
-        log.warning(f"  ! кнопки «{text}» уже нет на странице")
-        raise _SendNotAttempted("кнопка быстрого ответа исчезла до нажатия")
+    if button.count() != 1:
+        raise _SendNotAttempted("кнопка быстрого ответа исчезла или неоднозначна")
     control.sleep(random.uniform(0.4, 0.9))
-    if guard is not None and not guard():
+    current = _button_scope(page)
+    if (not current or any(current[key] != scope[key] for key in ("chat_id", "message_id", "attribute", "question"))
+            or text not in current["buttons"] or not safe_chat_button(
+                text, current["question"], existing_application=current.get("existing_application") is True)
+            or not _chat_url_matches(page, scope["chat_id"], chat_url) or guard is not None and not guard()):
         raise _SendNotAttempted("сообщение или отправитель сменились перед нажатием ответа")
     log.info(f"  → нажимаю кнопку «{text}»")
-    button.last.click()
+    button.click()
     deadline = time.monotonic() + 8
     while time.monotonic() < deadline:
         control.sleep(0.4)
-        if (_transcript(page) or "") != before:
+        after = _transcript(page)
+        if after and after != before and _chat_url_matches(page, scope["chat_id"], chat_url):
             log.success("  ✓ ответ кнопкой отправлен")
             return True
     return False
+
+
+def _chat_url_matches(page: Page, chat_id: str, base_url: str = "https://hh.ru/chat") -> bool:
+    try:
+        actual, origin = urlsplit(page.url), urlsplit(base_url)
+        return bool(actual.scheme == origin.scheme and actual.netloc == origin.netloc
+                    and not actual.username and not actual.password and actual.path.rstrip("/") == f"/chat/{chat_id}")
+    except (TypeError, ValueError, AttributeError):
+        return False
 
 
 def _composer_input(page: Page):

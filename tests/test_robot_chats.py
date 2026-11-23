@@ -51,7 +51,7 @@ class RobotReplies(unittest.TestCase):
         self.cfg.ai.max_answers_per_chat = 5
         self.chat = chats._Chat("chat1", "Разработчик", "Компания", self.QUESTION, True, latest_at="12:00")
         self.robot = chats._Sender("Помощник", "chatik-chat-message-123", provider_robot=True)
-        self.page = Mock()
+        self.page = Mock(url="https://hh.ru/chat/chat1")
         self.ai = Mock(notes=[])
         self.ai.decide.side_effect = lambda *args: Decision("question", self.QUESTION, "Работаю с Python.")
         self.stats = chats.ChatStats()
