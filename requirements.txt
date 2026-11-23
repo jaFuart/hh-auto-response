@@ -1,0 +1,7 @@
+playwright>=1.59
+seleniumbase==4.58.3
+openpyxl>=3.1
+pillow>=10.1
+pypdf>=4.2
+python-dotenv>=1.0
+tzdata>=2024.1

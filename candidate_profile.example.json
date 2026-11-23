@@ -1,0 +1,30 @@
+{
+  "schema_version": "1.0",
+  "candidate": {
+    "primary_title": "Python-разработчик",
+    "full_name": "",
+    "current_employer": "",
+    "experience_claim": "",
+    "languages": {}
+  },
+  "competencies": {
+    "backend": {
+      "hands_on": ["Python", "SQLite"],
+      "familiar": [],
+      "needs_confirmation": []
+    }
+  },
+  "projects": [
+    {
+      "name": "Учебный каталог (синтетический пример)",
+      "description": "Пример структуры. Замените своими подтверждёнными фактами до подключения профиля.",
+      "role": "Личный учебный проект",
+      "technology": ["Python", "SQLite"],
+      "personal_contribution": ["Реализовал поиск и фильтрацию записей на Python."],
+      "restriction": "Учебный проект; не коммерческий production-опыт."
+    }
+  ],
+  "clarifications": [],
+  "strengths": [],
+  "screening_examples": []
+}

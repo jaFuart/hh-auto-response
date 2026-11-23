@@ -1,0 +1,98 @@
+# Сервер: пример расписания в 10:00 по Москве и интервала проверки роботов 15 минут.
+# Скопируйте в hh-data/config.server.toml и заполните резюме/поиск; ключ хранится в hh-data/.env.
+# Автозапуск включайте после проверки своей конфигурации и сессии.
+search_url = ""
+resume_url = ""
+skip_on_resume_mismatch = true
+
+[search]
+mode = "resume"
+query = ""
+
+[limits]
+max_responses = 10
+max_pages = 3
+delay_min = 10
+delay_max = 15
+# Сохраняемые ограничения; обычная пауза освобождает браузер для фоновых роботов.
+submission_interval_seconds = 180
+submission_batch_size = 2
+submission_batch_pause_minutes = 25
+captcha_cooldown_minutes = 120  # на это время приостанавливаются все фоновые запросы к hh
+read_interval_seconds = 10
+max_responses_per_day = 10  # подтверждённые отклики + сегодняшние попытки с неясной доставкой, Europe/Moscow
+captcha_rest = 0  # старый адаптивный таймер; новая политика заменяет его
+per_company = 1
+per_company_days = 30
+
+[filters]
+require_gph = false
+gph_allow_unspecified = false
+# Например: ["менеджер по продаж", "менеджер продаж", "sales manager"].
+exclude_title_words = []
+# Например: ["Битрикс24", "amoCRM"]. Проверяется полный текст до отклика; недоступное описание — пропуск.
+exclude_description_words = []
+hide_unwanted = false
+
+[letter]
+mode = "ai"
+ai_max_chars = 1400
+fallback_text = ""
+experience_first = true
+ai_prompt = ""
+
+[ai]
+max_answer_chars = 1200
+enabled = true
+provider = "openai"
+api_key = ""
+# Укажите имя модели, доступной у вашего поставщика API.
+model = "YOUR_MODEL"
+context = ""
+# Необязательный профиль; относительный путь — от папки этого конфига.
+# Заполните candidate_profile.example.toml своими фактами; пример пути: data/candidate_profile.toml.
+profile_path = ""
+competency_map_path = ""  # необязательно: свои расширенные кейсы Markdown
+profile_notes_path = ""  # необязательно: свои подтверждённые примеры ответов
+only_robot = true
+documents_ready = false
+answer_prompt = ""
+timeout = 60
+candidate_gender = "male"
+
+[questions]
+skip_all = true
+answer_salary = false
+
+[chats]
+mode = "all"
+
+[browser]
+backend = "playwright"  # seleniumbase_uc: на Linux полный Chrome с внутренним Xvfb
+channel = ""
+headless = true
+hide_window = false
+profile_dir = "browser-profile-server"
+
+[geo]
+timezone = "Europe/Moscow"
+
+[schedule]
+enabled = false
+times = ["10:00"]
+days = ["1", "2", "3", "4", "5", "6", "7"]
+chats_after = false
+keep_awake = false
+
+[watch]
+invitations = false
+robot_replies = false
+robot_every_minutes = 15
+robot_max_chats_per_check = 10  # весь список за 30 дней; открывается не более 10 чатов за цикл
+robot_reply_interval_seconds = 30
+
+[raising]
+enabled = false
+
+[dream]
+enabled = false

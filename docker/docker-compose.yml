@@ -1,0 +1,27 @@
+# Из корня проекта: docker compose -f docker/docker-compose.yml up -d hh
+# Первый вход — локальный scripts/session.py login и перенос сессии; см. SERVER_RU.md.
+# env_file.required требует Docker Compose >= 2.24.0.
+name: hh-auto-response
+x-hh-common: &hh-common
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+  image: hh-auto-response:server
+  init: true
+  env_file:
+    - path: ../.env
+      required: false
+  environment:
+    HH_AUTO_HOME: /data
+    TZ: Europe/Moscow
+  volumes:
+    - ../hh-data:/data
+  shm_size: "1gb"
+  stop_grace_period: 90s
+
+services:
+  hh:
+    <<: *hh-common
+    restart: unless-stopped
+    command: ["server", "--config", "/data/config.server.toml", "--timezone", "Europe/Moscow"]
+    # Без видимого окна, VNC и открытых портов; UC использует внутренний Xvfb по запросу.

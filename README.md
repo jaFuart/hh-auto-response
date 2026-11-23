@@ -1,2 +1,108 @@
-# hh-auto-response
-hh.ru bot for scheduled job applications, AI cover letters and recruiter chatbot replies. Self-hosted with Python, Docker, Playwright and SeleniumBase.
+# HH Auto Response Server
+
+[![Server checks](https://github.com/jaFuart/hh-auto-response/actions/workflows/server.yml/badge.svg)](https://github.com/jaFuart/hh-auto-response/actions/workflows/server.yml)
+
+**Отклики на hh.ru по расписанию, персональные письма и ответы роботам — в Linux Docker без desktop-интерфейса.**
+
+Проект использует выбранное резюме, фильтры вакансий и отдельный профиль подтверждённых компетенций. По умолчанию контейнер запускает headless Chromium через Playwright. Можно выбрать SeleniumBase UC: на Linux он использует полный Chrome с внутренним виртуальным экраном Xvfb. Оба варианта работают без видимого окна, VNC и открытых портов и последовательно выполняют задачи. Видимый браузер нужен только для разового локального входа в hh; после входа его окно закрывается.
+
+## Что умеет сервер
+
+- Отбирать вакансии по настройкам hh и дополнительным фильтрам: слова в названии и описании, компании, уровень, условия оформления.
+- Готовить сопроводительное под текст вакансии, инструкции работодателя и подтверждённые кейсы кандидата.
+- Отвечать на вопросы текущего робота hh в прочитанных и непрочитанных чатах за последние 30 дней. Сообщения людей остаются без автоматического ответа.
+- Запускать отклики в заданное время и проверять роботов с отдельным интервалом. Задачи используют один профиль по очереди.
+- Сохранять историю, фактический текст отправленного письма, метаданные генерации и очередь технических повторов.
+
+Модель и поставщик API настраиваются через конфиг. Есть поддержка OpenAI, OpenAI-совместимых API и Ollama. Профиль кандидата хранится отдельно от программы: исходники можно обновлять, не меняя личные данные.
+
+## Начать
+
+1. [Подготовить конфиг, локальную сессию и выбрать резюме](SETUP_RU.md).
+2. [Настроить профиль компетенций и модель](docs/CONFIGURATION.md).
+3. [Развернуть Docker, проверить фильтры и включить расписание](SERVER_RU.md).
+
+В публичных примерах расписание и фоновые ответы выключены. Сначала заполните свои настройки и выполните `responses --dry-run`, затем включите нужные задачи.
+
+`init` задаёт интервал попыток отправки откликов 180 секунд, серии по 2 попытки с паузой 25 минут и дневной лимит 10 по Москве. В дневной лимит входят подтверждённые отклики и попытки за сегодня с ещё неясной доставкой. Между чтениями страниц — минимум 10 секунд. На обычной паузе браузер закрывается, а проверка роботов продолжает работать. Первая CAPTCHA включает сохраняемую двухчасовую паузу для всех фоновых запросов к hh. Эти ограничения не гарантируют отсутствие CAPTCHA.
+
+Проверка роботов запускается через 15 минут после завершения предыдущей: за цикл открывается не более 10 чатов, ответы отправляются с интервалом минимум 30 секунд. Учитываются также прочитанные чаты; большая очередь может занять несколько циклов. Поля и правила описаны в [CONFIGURATION.md](docs/CONFIGURATION.md#интервалы-и-ограничения-запросов).
+
+```bash
+git clone https://github.com/jaFuart/hh-auto-response.git
+cd hh-auto-response
+docker compose -f docker/docker-compose.yml build hh
+docker compose -f docker/docker-compose.yml run --rm hh configure init --gender male --provider openai --model YOUR_MODEL
+```
+
+Замените `YOUR_MODEL` на имя доступной вам модели; для женского рода выберите `--gender female`. Команда создаёт `hh-data/config.server.toml` и пустой `hh-data/.env`, оставляя расписание и ответы роботам выключенными. Факты синтетического профиля автоматически не подключаются. Существующие файлы не заменяются без `--overwrite`.
+
+Браузерный движок по умолчанию — `playwright`. При первой инициализации для Linux можно добавить `--browser-backend seleniumbase_uc`. Для существующей установки измените только `[browser] backend`, сохранив личные данные и фильтры. Оба движка входят в общий Docker-образ; выбор и проверка описаны в [SERVER_RU.md](SERVER_RU.md#выбрать-браузерный-движок). UC не гарантирует отсутствие капчи или повторного входа.
+
+На Linux Docker создаёт личные файлы от root. Если вы работаете под обычным пользователем, после `init` выполните из корня проекта:
+
+```bash
+sudo chown -R "$(id -u):$(id -g)" hh-data
+```
+
+Заполните ключ в `hh-data/.env`, затем выполните локальный вход и выбор резюме по [SETUP_RU.md](SETUP_RU.md). Если конфиг уже создан в Docker, пропустите повторный `configure init` в инструкции и используйте существующие файлы. Свой JSON/TOML и Markdown подключаются явными флагами `--profile`/`--competency-map`; примеры — в [CONFIGURATION.md](docs/CONFIGURATION.md).
+
+## Основные команды Docker
+
+Все команды выполняются из корня проекта. Перед ручной командой с браузером остановите основной контейнер: один профиль нельзя использовать параллельно.
+
+```bash
+# Только состояние: без браузера, модели и отправок.
+docker compose -f docker/docker-compose.yml run --rm hh server --status
+
+# Проверить локальные настройки без браузера, модели и изменений файлов.
+docker compose -f docker/docker-compose.yml run --rm hh configure doctor
+
+# Проверить сохранённый вход; ничего не отправляет.
+docker compose -f docker/docker-compose.yml run --rm hh session check
+
+# Показать собственные резюме / выбрать одно / обновить его текст.
+docker compose -f docker/docker-compose.yml run --rm hh resumes list
+docker compose -f docker/docker-compose.yml run --rm hh resumes select --id RESUME_ID
+docker compose -f docker/docker-compose.yml run --rm hh resumes fetch
+
+# Проверить выдачу и фильтры без откликов.
+docker compose -f docker/docker-compose.yml run --rm hh responses --dry-run --limit 3
+
+# Постоянная работа по конфигурации.
+docker compose -f docker/docker-compose.yml up -d hh
+```
+
+`responses` без `--dry-run` отправляет отклики. `chats` с включённым `[ai]` может отправлять ответы роботам. `server --once` выполняет задачи, которым подошло время, и тоже может отправлять. Это рабочие команды, а не предпросмотр.
+
+## Конфигурация и данные
+
+Основной файл — `hh-data/config.server.toml`, в контейнере `/data/config.server.toml`. Относительные пути профиля и карты компетенций отсчитываются от папки выбранного конфига.
+
+- `hh_auto/` — сервер, автоматизация hh, генерация, отчёты.
+- `scripts/` — CLI: сервер, вход и сессия, резюме, отклики, чаты, проверка модели.
+- `docker/` — серверный образ с Playwright и необязательным SeleniumBase UC, Compose и точки запуска.
+- `tests/` — синтетические проверки без реальных откликов.
+- `docs/CONFIGURATION.md` — модель, личный профиль и карта кейсов.
+- `hh-data/` и `.env` — личные настройки, сессия, история и ключи; в Git не входят. Новая инициализация использует `hh-data/.env`; старый корневой `.env` также поддерживается.
+
+Не удаляйте `data/state.json`, `data/chat_answers.jsonl`, `data/application-delivery.json`, `data/server-state.json`, `data/submission-pacing.json` и `data/robot-chat-scan.json` при обновлении: в них хранятся история, сроки пауз и очередь чатов. Логи и отчёты могут содержать резюме, вакансии и переписку.
+
+## Проверки для разработки
+
+```bash
+python -m compileall -q hh_auto scripts
+python -m unittest discover -s tests
+python tests/e2e_server_mode.py
+python tests/e2e_application_retry.py
+python tests/e2e_setup.py
+python scripts/audit_repository.py . --git-history
+```
+
+E2E-проверки используют локальные макеты hh и модели. Реальные аккаунт, ключ и отправки не нужны. Правила разработки — в [CONTRIBUTING.md](CONTRIBUTING.md).
+
+Проверку секретов запускайте в чистом публикуемом репозитории. Рабочая папка с приватной `.env` и `hh-data/` для этой команды не подходит.
+
+## Происхождение и лицензия
+
+Серверная версия основана на [BlazeStudio/HH-Auto-Response](https://github.com/BlazeStudio/HH-Auto-Response). Исходные уведомления об авторстве и [PolyForm Noncommercial License 1.0.0](LICENSE.md) сохранены. Условия использования смотрите в файле лицензии.

@@ -1,0 +1,42 @@
+name: Server checks
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: server-tests-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Dependencies and headless browser
+        run: |
+          python -m pip install -r requirements.txt
+          python -m playwright install --with-deps --only-shell chromium
+      - name: Compile and unit tests
+        run: |
+          python scripts/audit_repository.py . --git-history
+          python -m compileall -q hh_auto scripts tests
+          python -m unittest discover -s tests
+      - name: Isolated headless scenarios
+        run: |
+          python tests/e2e_server_mode.py
+          python tests/e2e_application_retry.py
+          python tests/e2e_setup.py
+      - name: Build server image
+        run: |
+          docker build -f docker/Dockerfile -t hh-auto-response:ci .
+          docker run --rm --network none -v "$PWD/tests:/app/tests:ro" hh-auto-response:ci python /app/tests/e2e_setup.py --entrypoint
+          docker run --rm --init --network none --shm-size 1g -v "$PWD/tests:/app/tests:ro" hh-auto-response:ci python /app/tests/e2e_seleniumbase_backend.py

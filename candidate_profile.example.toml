@@ -1,0 +1,13 @@
+# Синтетический пример структуры, не факты о владельце бота.
+# Копируйте в hh-data/data/candidate_profile.toml и оставьте только подтверждённые вами сведения.
+# Затем [ai] profile_path = "data/candidate_profile.toml" в hh-data/config.toml или config.server.toml.
+version = 1
+role = "Python-разработчик"
+confirmed_skills = ["Python", "SQL"]
+clarifications = ["Разрабатываю Python-сервисы и работаю с SQL."]
+
+# Технологии связываются с проектом только здесь, без догадок по общему списку навыков.
+[[projects]]
+name = "Учебный каталог (синтетический пример)"
+technologies = ["Python", "SQLite"]
+tasks = ["Реализовал поиск и фильтрацию записей."]

@@ -1,0 +1,36 @@
+__pycache__/
+*.pyc
+.venv/
+.tmp/
+.env
+.env.*
+!.env.example
+
+# данные программы: config.toml, профиль браузера с сессией hh, логи и история откликов
+# (из исходников и в Docker — папка hh-data/)
+hh-data/
+
+# сборка приложения
+.venv-build
+build/
+dist/
+
+# так данные лежали до 1.0.4 — при первом запуске они сами переедут в hh-data/
+config.toml
+app_prefs.json
+browser-profile/
+logs/
+data/
+
+# личные источники кандидата хранятся вне публикуемого кода
+candidate_profile_hh.json
+competency_map_maxim.md
+hh_bot_codex_task.md
+*.session.json
+*-session.json
+*.pem
+*.key
+*.tar.gz
+*.zip
+*.jsonl
+*.log
